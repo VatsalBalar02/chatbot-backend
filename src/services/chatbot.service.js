@@ -1,26 +1,4 @@
 // src/services/chatbot.service.js
-//
-// Orchestrator — routes every user question to the right engine.
-//
-// ─────────────────────────────────────────────────────────────
-// DESIGN CHANGE:
-//
-//   Old approach: chatbot.service.js had its own keyword lists,
-//   two-tier routing logic, nameExistsInCache scanning, and a
-//   separate classifyIntent call. These were all fragile.
-//
-//   New approach:
-//     • For candidate questions  → answerFromCache() is called.
-//       Inside it, analyzeQuestion() (one LLM call) handles ALL
-//       understanding: intent, entities, sections needed.
-//
-//     • For non-candidate questions → a SINGLE classifyIntent()
-//       call distinguishes PDF / REPORT / OOS.
-//
-//     • The routing here is just: "does this look like it could
-//       involve candidate data?" — we ask analyzeQuestion and
-//       trust its intent field. No hardcoded keyword lists.
-// ─────────────────────────────────────────────────────────────
 
 import { loadPdfVectorstore } from "./rag.service.js";
 import { classifyIntent } from "./ai.service.js";
@@ -33,7 +11,6 @@ import { PDF_PATH, VECTRA_DIR, MAX_HISTORY } from "../config/constants.js";
 let vectorstore = null;
 let conversationHistory = [];
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
 export async function init() {
   log.info("Step 1/2: Loading PDF vectorstore...");
   vectorstore = await loadPdfVectorstore(PDF_PATH, VECTRA_DIR);
@@ -55,15 +32,14 @@ export async function init() {
 export function getVectorstore() {
   return vectorstore;
 }
+
 export function resetConversation() {
   conversationHistory = [];
   log.info("Conversation history cleared.");
 }
 
-// ─── Out-of-scope response ────────────────────────────────────────────────────
 function runOutOfScope(question) {
-  const shortQ =
-    question.length > 70 ? question.slice(0, 70) + "..." : question;
+  const shortQ = question.length > 70 ? question.slice(0, 70) + "..." : question;
   return {
     type: "OUT_OF_SCOPE",
     answer:
@@ -79,7 +55,6 @@ function runOutOfScope(question) {
   };
 }
 
-// ─── History ──────────────────────────────────────────────────────────────────
 function pushHistory(question, answer) {
   conversationHistory.push({ role: "user", content: question });
   conversationHistory.push({ role: "assistant", content: answer });
@@ -90,58 +65,47 @@ function pushHistory(question, answer) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN ENTRY POINT
+//
+// onChunk — optional (text: string) => void
+//           Plain string callback. Each call = one token or one table block.
+//           The controller wraps this into SSE { type:"token", text } format.
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// Flow:
-//   1. Try candidate cache first — answerFromCache internally calls
-//      analyzeQuestion which returns intent. If intent is CANDIDATE or COUNT,
-//      it answers. If intent is PDF/REPORT/OOS it returns that intent signal.
-//
-//   2. Use the intent signal to route to PDF, REPORT, or OOS.
-//
-// This means we have EXACTLY ONE LLM call for routing on the candidate path,
-// and EXACTLY ONE LLM call (classifyIntent) on the non-candidate path.
-// No double-calling, no keyword hacks, no fragile guards.
-
-export async function chatbot(question) {
+export async function chatbot(question, onChunk = null) {
   if (!question?.trim()) return runOutOfScope("(empty message)");
 
   question = question.trim();
   log.info(`\nQuestion: "${question}"`);
 
-  // ── Single call to answerFromCache — analyzeQuestion inside determines all ─
-  // If intent is CANDIDATE or COUNT  → result.success = true, answer is ready.
-  // If intent is PDF/REPORT/OOS      → result.success = false, result.forwardIntent is set.
-  const result = await answerFromCache(question);
+  // Pass onChunk inside the options object — answerFromCache expects { onChunk }
+  const result = await answerFromCache(question, { onChunk });
 
   if (result.success) {
-    log.info("→ Route: CANDIDATE CACHE");
-    pushHistory(question, result.answer);
+    log.info("-> Route: CANDIDATE CACHE");
+    pushHistory(question, result.answer ?? "");
     return {
       type: "CANDIDATE",
-      answer: result.answer,
+      answer: result.answer, // null when streaming
       dataframe: result.dataframe,
     };
   }
 
-  // ── analyzeQuestion decided this is not a candidate question ──────────────
   const intent = result.forwardIntent;
-  log.info(`→ Forward intent: ${intent}`);
+  log.info(`-> Forward intent: ${intent}`);
 
   if (intent === "PDF") {
-    log.info("→ Route: PDF");
+    log.info("-> Route: PDF");
     const r = await runPdfMode(question, conversationHistory, vectorstore);
     pushHistory(question, r.answer);
     return r;
   }
 
   if (intent === "REPORT") {
-    log.info("→ Route: REPORT");
+    log.info("-> Route: REPORT");
     const r = await runReportMode(question, conversationHistory);
     pushHistory(question, r.answer);
     return r;
   }
 
-  log.info("→ Route: OUT OF SCOPE");
+  log.info("-> Route: OUT OF SCOPE");
   return runOutOfScope(question);
 }

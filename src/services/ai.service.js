@@ -14,7 +14,7 @@ export function getOpenAIClient() {
 export async function classifyIntent(question) {
   const client = getOpenAIClient();
 
-  const INTENT_SYSTEM = `
+    const INTENT_SYSTEM = `
 You are a strict intent classifier for a Recruitment Management chatbot.
 
 Classify the user question into exactly one of these four labels:
@@ -78,345 +78,711 @@ Respond with ONLY the label: SQL, PDF, REPORT, or OUT_OF_SCOPE
   return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// flattenCandidateForDisplay
-// ─────────────────────────────────────────────────────────────────────────────
-// Converts a rich nested candidate object (with Applications[].Interviews[],
-// Skills[], Education[], etc.) into a flat, human-readable object that the
-// answer LLM can present in a table WITHOUT unrolling nested arrays into
-// separate rows.
+// ═════════════════════════════════════════════════════════════════════════════
+// RESPONSE TYPE DETECTION
+// ═════════════════════════════════════════════════════════════════════════════
 //
-// The rule: every array section is collapsed into a single readable string.
-// This means "5 candidates" → exactly 5 rows in the final table, no matter
-// how many interviews or applications each candidate has.
+// Six response types — picked automatically from the question + data:
 //
-function flattenCandidateForDisplay(candidate) {
-  const flat = {};
+//   COUNT_ANSWER  — "how many candidates have React?" → plain count sentence
+//   SKILLS_ONLY   — "skills of avinash", "avinash education" → focused single-field
+//   FULL_DETAILS  — "tell me about avinash", result ≤ 3 → complete prose profile
+//   COMPARE       — user says "compare / vs / difference between" → side-by-side prose
+//   SUMMARY       — result > 10, broad list → aggregated insight paragraph
+//   LIST          — everything else → inline prose list, first 8 + "and X more"
+//
+function detectResponseType(question, isSingleCandidate, totalFound, sectionsNeeded) {
+  const q = question.toLowerCase();
 
-  // ── Root ─────────────────────────────────────────────────────────────────
+  // ── COMPARE — explicit comparison keywords ────────────────────────────────
+  const compareWords = ["compare", "vs", "versus", "difference between", "contrast", "side by side"];
+  if (compareWords.some((w) => q.includes(w))) return "COMPARE";
+
+  // ── SKILLS_ONLY — user asked for a single specific field ──────────────────
+  // Triggered when sectionsNeeded is a small focused array (1–2 sections,
+  // neither of which is "ALL") AND the question mentions a field keyword.
+  const fieldKeywords = [
+    "skill", "skills", "education", "degree", "qualification",
+    "experience", "work", "company", "interview", "marks", "score",
+    "document", "resume", "phone", "email", "location", "city",
+  ];
+  const isFieldQuery = fieldKeywords.some((w) => q.includes(w));
+  const isSpecificSections =
+    Array.isArray(sectionsNeeded) &&
+    sectionsNeeded.length <= 3 &&
+    !sectionsNeeded.includes("ALL");
+
+  if (isFieldQuery && isSpecificSections) return "SKILLS_ONLY";
+
+  // ── FULL_DETAILS — specific candidate, broad ask, small result set ────────
+  if (isSingleCandidate && totalFound <= 3) return "FULL_DETAILS";
+
+  // ── SUMMARY — large result set with no specific filter ────────────────────
+  if (totalFound > 10 && !isSingleCandidate) return "SUMMARY";
+
+  // ── LIST — default for moderate result sets ───────────────────────────────
+  return "LIST";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COLUMN & SECTION MAPS
+// ═════════════════════════════════════════════════════════════════════════════
+
+const DETAIL_COLUMNS = [
+  "Name", "Email", "Phone", "Verified", "Profile Complete", "Registered On",
+  "Gender", "City", "State", "Languages", "Currently Studying",
+  "LinkedIn", "Portfolio/GitHub", "Date of Birth",
+  "Skills", "Education", "Experience",
+  "Jobs Applied", "Application Status", "Shortlisted", "Accepted",
+  "Interview Details", "Best Marks", "Documents Uploaded", "Resumes Uploaded",
+];
+
+const SECTION_TO_COLUMNS = {
+  "root":                    ["Name", "Email", "Phone", "Verified", "Profile Complete", "Registered On"],
+  "Profile":                 ["Gender", "City", "State", "Languages", "Currently Studying", "LinkedIn", "Portfolio/GitHub", "Date of Birth"],
+  "Skills":                  ["Skills"],
+  "Education":               ["Education"],
+  "Experience":              ["Experience"],
+  "Applications":            ["Jobs Applied", "Application Status", "Shortlisted", "Accepted"],
+  "Applications.Interviews": ["Interview Details", "Interview Status", "Best Marks"],
+  "Documents":               ["Documents Uploaded"],
+  "Resumes":                 ["Resumes Uploaded"],
+};
+
+function getColumnsForSections(sectionsNeeded) {
+  if (!Array.isArray(sectionsNeeded) || sectionsNeeded.length === 0) return DETAIL_COLUMNS;
+  const cols = new Set(["Name"]);
+  for (const sec of sectionsNeeded) {
+    (SECTION_TO_COLUMNS[sec] || []).forEach((c) => cols.add(c));
+  }
+  return [...cols];
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// FLATTEN CANDIDATE
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// mode = "detail"   → all fields, full interview breakdown
+// mode = "summary"  → summary fields only (name, city, edu, top skills, exp, status)
+//
+// sectionsNeeded — when provided, gates each section so only requested
+//                  fields are populated (e.g. ["root","Skills"] → Name + Skills only)
+//
+function flattenCandidate(candidate, mode = "summary", sectionsNeeded = null) {
+  const flat = {};
+  const isDetail = mode === "detail";
+
+  const wantedSections = Array.isArray(sectionsNeeded) ? new Set(sectionsNeeded) : null;
+  const wants = (sec) => !wantedSections || wantedSections.has(sec);
+
+  // ── Root ──────────────────────────────────────────────────────────────────
   flat["Name"] = candidate.FullName || "—";
-  flat["Email"] = candidate.email || "—";
-  flat["Phone"] = candidate.phoneNumber || "—";
-  flat["Verified"] = candidate.isVerified ? "Yes" : "No";
-  flat["Profile Complete"] = candidate.isProfileComplete ? "Yes" : "No";
-  if (candidate.RegisteredOn) {
-    flat["Registered On"] = new Date(candidate.RegisteredOn).toLocaleDateString(
-      "en-IN",
-      { day: "2-digit", month: "short", year: "numeric" },
-    );
+  if (wants("root")) {
+    flat["Email"] = candidate.email || "—";
+    flat["Phone"] = candidate.phoneNumber || "—";
+    if (isDetail) {
+      flat["Verified"] = candidate.isVerified ? "Yes" : "No";
+      flat["Profile Complete"] = candidate.isProfileComplete ? "Yes" : "No";
+      if (candidate.RegisteredOn)
+        flat["Registered On"] = new Date(candidate.RegisteredOn).toLocaleDateString(
+          "en-IN", { day: "2-digit", month: "short", year: "numeric" },
+        );
+    }
   }
 
   // ── Profile ───────────────────────────────────────────────────────────────
   const p = candidate.Profile;
   if (p) {
-    if (p.Gender) flat["Gender"] = p.Gender;
-    if (p.city) flat["City"] = p.city;
-    if (p.state) flat["State"] = p.state;
-    if (p.languageKnown) flat["Languages"] = p.languageKnown;
-    if (p.isStudying != null)
-      flat["Currently Studying"] = p.isStudying ? "Yes" : "No";
-    if (p.linkedinProfileUrl) flat["LinkedIn"] = p.linkedinProfileUrl;
-    if (p.portfolioGithubWebsiteUrl)
-      flat["Portfolio/GitHub"] = p.portfolioGithubWebsiteUrl;
-    if (p.dateOfBirth)
-      flat["Date of Birth"] = new Date(p.dateOfBirth).toLocaleDateString(
-        "en-IN",
-        { day: "2-digit", month: "short", year: "numeric" },
-      );
+    if (wants("Profile")) {
+      if (p.city) flat["City"] = p.city;
+      if (p.state) flat["State"] = p.state;
+      if (isDetail) {
+        if (p.Gender) flat["Gender"] = p.Gender;
+        if (p.languageKnown) flat["Languages"] = p.languageKnown;
+        if (p.isStudying != null)
+          flat["Currently Studying"] = p.isStudying ? "Yes" : "No";
+        if (p.linkedinProfileUrl) flat["LinkedIn"] = p.linkedinProfileUrl;
+        if (p.portfolioGithubWebsiteUrl)
+          flat["Portfolio/GitHub"] = p.portfolioGithubWebsiteUrl;
+        if (p.dateOfBirth)
+          flat["Date of Birth"] = new Date(p.dateOfBirth).toLocaleDateString(
+            "en-IN", { day: "2-digit", month: "short", year: "numeric" },
+          );
+      }
+    } else if (!wantedSections) {
+      // summary mode without section filter → always include city/state
+      if (p.city) flat["City"] = p.city;
+      if (p.state) flat["State"] = p.state;
+    }
   }
 
   // ── Skills ────────────────────────────────────────────────────────────────
-  if (Array.isArray(candidate.Skills) && candidate.Skills.length > 0) {
-    flat["Skills"] = candidate.Skills.map((s) => s.Skill)
-      .filter(Boolean)
-      .join(", ");
+  if (wants("Skills") && Array.isArray(candidate.Skills) && candidate.Skills.length > 0) {
+    const all = candidate.Skills.map((s) => s.Skill).filter(Boolean);
+    flat["Skills"] = isDetail
+      ? all.join(", ")
+      : all.slice(0, 5).join(", ") + (all.length > 5 ? ` +${all.length - 5} more` : "");
+    flat["_allSkills"] = all; // raw array for SUMMARY aggregation
   }
 
   // ── Education ─────────────────────────────────────────────────────────────
-  if (Array.isArray(candidate.Education) && candidate.Education.length > 0) {
-    const eduLines = candidate.Education.map((e) => {
+  if (wants("Education") && Array.isArray(candidate.Education) && candidate.Education.length > 0) {
+    const lines = candidate.Education.map((e) => {
       const parts = [];
       if (e.UnderGraduationDegree)
-        parts.push(
-          `UG: ${e.UnderGraduationDegree}${e.underGraduationUniversityName ? ` (${e.underGraduationUniversityName})` : ""}`,
-        );
+        parts.push(`UG: ${e.UnderGraduationDegree}${e.underGraduationUniversityName ? ` (${e.underGraduationUniversityName})` : ""}`);
       if (e.PostGraduationDegree)
-        parts.push(
-          `PG: ${e.PostGraduationDegree}${e.postGraduationUniversityName ? ` (${e.postGraduationUniversityName})` : ""}`,
-        );
+        parts.push(`PG: ${e.PostGraduationDegree}${e.postGraduationUniversityName ? ` (${e.postGraduationUniversityName})` : ""}`);
       return parts.join(" | ");
     }).filter(Boolean);
-    if (eduLines.length) flat["Education"] = eduLines.join("; ");
+    if (lines.length) flat["Education"] = lines.join("; ");
   }
 
   // ── Experience ────────────────────────────────────────────────────────────
-  if (Array.isArray(candidate.Experience) && candidate.Experience.length > 0) {
-    const expLines = candidate.Experience.filter(
-      (e) => e.companyName && e.companyName.trim() !== "",
-    ).map((e) => {
-      const current = e.isCurrentCompany ? " (Current)" : "";
-      return `${e.companyName} — ${e.role || "N/A"}${current}`;
-    });
-    if (expLines.length) flat["Experience"] = expLines.join("; ");
+  if (wants("Experience") && Array.isArray(candidate.Experience) && candidate.Experience.length > 0) {
+    const lines = candidate.Experience
+      .filter((e) => e.companyName && e.companyName.trim() !== "")
+      .map((e) => `${e.companyName} — ${e.role || "N/A"}${e.isCurrentCompany ? " (Current)" : ""}`);
+    if (lines.length) flat["Experience"] = lines.join("; ");
   }
 
   // ── Applications + Interviews ─────────────────────────────────────────────
-  // Collapse ALL interviews across ALL applications into a single summary
-  // string so the table stays one row per candidate.
-  if (
-    Array.isArray(candidate.Applications) &&
-    candidate.Applications.length > 0
-  ) {
-    // Jobs applied for
-    const jobTitles = [
-      ...new Set(candidate.Applications.map((a) => a.JobTitle).filter(Boolean)),
-    ];
-    if (jobTitles.length) flat["Jobs Applied"] = jobTitles.join(", ");
+  if (wants("Applications") && Array.isArray(candidate.Applications) && candidate.Applications.length > 0) {
+    const jobs = [...new Set(candidate.Applications.map((a) => a.JobTitle).filter(Boolean))];
+    if (jobs.length) flat["Jobs Applied"] = jobs.join(", ");
 
-    // Application statuses
-    const appStatuses = [
-      ...new Set(candidate.Applications.map((a) => a.Status).filter(Boolean)),
-    ];
-    if (appStatuses.length) flat["Application Status"] = appStatuses.join(", ");
+    const statuses = [...new Set(candidate.Applications.map((a) => a.Status).filter(Boolean))];
+    if (statuses.length) flat["Application Status"] = statuses.join(", ");
 
-    // Shortlisted / Accepted flags
-    const shortlisted = candidate.Applications.some((a) => a.isShortlisted);
-    const accepted = candidate.Applications.some((a) => a.isAccepted);
-    flat["Shortlisted"] = shortlisted ? "Yes" : "No";
-    flat["Accepted"] = accepted ? "Yes" : "No";
+    flat["Shortlisted"] = candidate.Applications.some((a) => a.isShortlisted) ? "Yes" : "No";
+    flat["Accepted"]    = candidate.Applications.some((a) => a.isAccepted)    ? "Yes" : "No";
 
-    // Interview summary — collapse to one readable line per application
-    const interviewLines = [];
-    for (const app of candidate.Applications) {
-      if (!Array.isArray(app.Interviews) || app.Interviews.length === 0)
-        continue;
-      for (const iv of app.Interviews) {
-        const parts = [];
-        if (app.JobTitle) parts.push(`Job: ${app.JobTitle}`);
-        if (iv.InterviewStatus) parts.push(`Status: ${iv.InterviewStatus}`);
-        if (iv.Interviewer) parts.push(`Interviewer: ${iv.Interviewer}`);
-        if (iv.isQualified != null)
-          parts.push(`Qualified: ${iv.isQualified ? "Yes" : "No"}`);
-        if (iv.marksObtained != null)
-          parts.push(`Marks: ${iv.marksObtained}/${iv.totalMarks ?? "?"}`);
-        if (iv.feedback && iv.feedback.trim())
-          parts.push(`Feedback: "${iv.feedback.trim()}"`);
-        if (parts.length) interviewLines.push(parts.join(" | "));
+    const allInterviews = candidate.Applications.flatMap(
+      (a) => (a.Interviews || []).map((iv) => ({ ...iv, JobTitle: a.JobTitle }))
+    );
+
+    if (allInterviews.length > 0) {
+      if (isDetail) {
+        const ivLines = allInterviews.map((iv) => {
+          const p = [];
+          if (iv.JobTitle) p.push(`Job: ${iv.JobTitle}`);
+          if (iv.InterviewStatus) p.push(`Status: ${iv.InterviewStatus}`);
+          if (iv.Interviewer) p.push(`Interviewer: ${iv.Interviewer}`);
+          if (iv.isQualified != null) p.push(`Qualified: ${iv.isQualified ? "Yes" : "No"}`);
+          if (iv.marksObtained != null) p.push(`Marks: ${iv.marksObtained}/${iv.totalMarks ?? "?"}`);
+          if (iv.feedback?.trim()) p.push(`Feedback: "${iv.feedback.trim()}"`);
+          return p.join(" | ");
+        }).filter(Boolean);
+        if (ivLines.length) flat["Interview Details"] = ivLines.join("\n");
+      } else {
+        const uniqueStatuses = [...new Set(allInterviews.map((iv) => iv.InterviewStatus).filter(Boolean))];
+        if (uniqueStatuses.length) flat["Interview Status"] = uniqueStatuses.join(", ");
+      }
+
+      // Best marks — always compute for both modes
+      const allMarks = allInterviews
+        .map((iv) => iv.marksObtained)
+        .filter((m) => m != null)
+        .map(Number);
+      if (allMarks.length > 0) {
+        const best = Math.max(...allMarks);
+        const iv = allInterviews.find((i) => Number(i.marksObtained) === best);
+        flat["Best Marks"] = `${best}/${iv?.totalMarks ?? "?"}`;
       }
     }
-    if (interviewLines.length) {
-      flat["Interview Details"] = interviewLines.join("\n");
-    }
   }
 
-  // ── Documents ─────────────────────────────────────────────────────────────
-  if (candidate.Documents && typeof candidate.Documents === "object") {
+  // ── Documents (detail only) ───────────────────────────────────────────────
+  if (isDetail && candidate.Documents && typeof candidate.Documents === "object") {
     const doc = candidate.Documents;
-    const docList = [
-      doc.adharPath ? "Aadhar" : null,
-      doc.pancardPath ? "PAN Card" : null,
-      doc.bankpassbook ? "Bank Passbook" : null,
-      doc.bankStatement ? "Bank Statement" : null,
-      doc.salarySlip ? "Salary Slip" : null,
-      doc.expierenceLetter ? "Experience Letter" : null,
-      doc.offerLetter ? "Offer Letter" : null,
-      doc.itr ? "ITR" : null,
+    const list = [
+      doc.adharPath       ? "Aadhar"            : null,
+      doc.pancardPath     ? "PAN Card"           : null,
+      doc.bankpassbook    ? "Bank Passbook"      : null,
+      doc.bankStatement   ? "Bank Statement"     : null,
+      doc.salarySlip      ? "Salary Slip"        : null,
+      doc.expierenceLetter? "Experience Letter"  : null,
+      doc.offerLetter     ? "Offer Letter"       : null,
+      doc.itr             ? "ITR"                : null,
     ].filter(Boolean);
-    if (docList.length) flat["Documents Uploaded"] = docList.join(", ");
+    if (list.length) flat["Documents Uploaded"] = list.join(", ");
   }
 
-  // ── Resumes ───────────────────────────────────────────────────────────────
-  if (Array.isArray(candidate.Resumes) && candidate.Resumes.length > 0) {
+  // ── Resumes (detail only) ─────────────────────────────────────────────────
+  if (isDetail && Array.isArray(candidate.Resumes) && candidate.Resumes.length > 0)
     flat["Resumes Uploaded"] = candidate.Resumes.length.toString();
-  }
 
   return flat;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// generateNaturalAnswer
-// ─────────────────────────────────────────────────────────────────────────────
-// rows    — array of candidate objects from the cache (nested JSON)
-// options — { userLimit: number|null, totalFound: number }
-//
-// userLimit: the number the user explicitly asked for ("5 candidates" → 5).
-//            Used to tell the LLM "show exactly N candidates, one row each".
-// totalFound: the real total matching candidates in the DB, used for the
-//             "there are X more" footer note.
-//
-// export async function generateNaturalAnswer(
-//   question,
-//   sqlQuery,
-//   rows,
-//   options = {},
-// ) {
-//   const client = getOpenAIClient();
+// ═════════════════════════════════════════════════════════════════════════════
+// RESPONSE BUILDERS — one per type
+// ═════════════════════════════════════════════════════════════════════════════
 
-//   if (!rows || rows.length === 0) {
-//     return "No records found matching your query.";
-//   }
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-//   const { userLimit = null, totalFound = rows.length } = options;
+function degreeShort(eduStr) {
+  if (!eduStr || eduStr === "—") return null;
+  return eduStr
+    .split(";")[0]
+    .trim()
+    .replace(/\s*\([^)]*\)/g, "")
+    .replace(/^(UG:|PG:)\s*/i, "")
+    .trim();
+}
 
-//   // Flatten every candidate into a clean display object.
-//   // This is the key step that prevents interview rows from exploding
-//   // the table — each candidate becomes exactly ONE flat object.
-//   const flatRows = rows.map(flattenCandidateForDisplay);
+function currentRole(expStr) {
+  if (!expStr || expStr === "—") return null;
+  const current = expStr.split(";").find((e) => e.includes("(Current)"));
+  return current ? current.replace("(Current)", "").trim() : null;
+}
 
-//   // Remove keys that are all "—" / empty across every row to keep table clean
-//   const allKeys = [...new Set(flatRows.flatMap((r) => Object.keys(r)))];
-//   const usedKeys = allKeys.filter((k) =>
-//     flatRows.some((r) => r[k] && r[k] !== "—"),
-//   );
-//   const cleanRows = flatRows.map((r) =>
-//     Object.fromEntries(usedKeys.map((k) => [k, r[k] ?? "—"])),
-//   );
-
-//   const displayCount = cleanRows.length; // rows actually sent
-//   const hiddenCount = totalFound - displayCount; // still in DB but not shown
-//   const requestedCount = userLimit ?? displayCount;
-
-//   const dataContext = JSON.stringify(cleanRows, null, 2);
-
-//   const systemPrompt = `
-// You are a helpful HR and recruitment assistant chatbot.
-
-// The data below has already been pre-processed: each object represents
-// exactly ONE candidate. Do NOT split a candidate into multiple rows.
-
-// STRICT RULES:
-// 1. ONE ROW PER CANDIDATE in any table you produce — never one row per interview,
-//    one row per application, or one row per skill. The data is already flattened.
-// 2. The user asked for ${requestedCount} candidate(s). Show exactly ${displayCount} candidate row(s) — no more, no less.
-// 3. Use a clean markdown table. Column headers come from the JSON keys.
-// 4. If a field contains multiple values separated by newlines (like "Interview Details"),
-//    keep it in a single table cell — do not split it into rows.
-// 5. Format dates as human-readable (e.g. "12 Feb 2026"). Never show raw ISO strings.
-// 6. Never show raw UUIDs as identifiers — use Name or Email instead.
-// 7. Never mention SQL, queries, stored procedures, cache, or any technical terms.
-// 8. Keep tone friendly and professional.
-// 9. Start with one natural sentence summarising what you found.
-// ${hiddenCount > 0 ? `10. After the table, add a note: "Showing ${displayCount} of ${totalFound} matching candidates. Generate a report to see all results."` : ""}
-// `.trim();
-
-//   const userPrompt = `
-// User question: "${question}"
-
-// Candidate data (${displayCount} candidate${displayCount !== 1 ? "s" : ""}):
-// ${dataContext}
-
-// Please give a clear, well-formatted answer with a markdown table.
-// One row per candidate only.
-// `.trim();
-
-//   const resp = await client.chat.completions.create({
-//     model: "gpt-4o-mini",
-//     messages: [
-//       { role: "system", content: systemPrompt },
-//       { role: "user", content: userPrompt },
-//     ],
-//     temperature: 0.3,
-//     max_tokens: 1500,
-//   });
-
-//   return (resp.choices[0].message.content || "").trim();
-// }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// formatCandidatesAsMarkdown (NEW HELPER FUNCTION)
-// ─────────────────────────────────────────────────────────────────────────────
-// Formats candidate data as a clean markdown table CLIENT-SIDE (instant)
-// This replaces the slow LLM-based table formatting
-//
-function formatCandidatesAsMarkdown(flatRows, options = {}) {
-  const { totalFound = flatRows.length } = options;
-
-  if (flatRows.length === 0) return null;
-
-  // Get all unique keys across all rows
-  const allKeys = [...new Set(flatRows.flatMap((r) => Object.keys(r)))];
-  
-  // Keep only columns that have at least one non-empty value
-  const usedKeys = allKeys.filter((k) =>
-    flatRows.some((r) => r[k] && r[k] !== "—")
-  );
-
-  // Build markdown table
-  const headers = usedKeys.join(" | ");
-  const separator = usedKeys.map(() => "---").join(" | ");
-  const rows = flatRows
-    .map((row) =>
-      usedKeys
-        .map((key) => {
-          const value = row[key] || "—";
-          // Replace newlines with <br> for markdown rendering
-          return value.replace(/\n/g, "<br>");
-        })
-        .join(" | ")
-    )
-    .join("\n");
-
-  const table = `${headers}\n${separator}\n${rows}`;
-
-  // Add footer if there are hidden results
-  const hiddenCount = totalFound - flatRows.length;
-  const footer =
-    hiddenCount > 0
-      ? `\n\n*Showing ${flatRows.length} of ${totalFound} matching candidates. Generate a report to see all results.*`
-      : "";
-
-  return table + footer;
+function locationStr(r) {
+  return [r["City"], r["State"]].filter((v) => v && v !== "—").join(", ") || null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generateNaturalAnswer (OPTIMIZED VERSION)
+// TYPE 1 — LIST
+// Inline prose, first 8 candidates, "and X more" at end.
+// Format: "Name1, who lives in Location with education in Degree and skills in
+//          S1, S2, S3; Name2, who...; and X more candidates."
 // ─────────────────────────────────────────────────────────────────────────────
-// PERFORMANCE IMPROVEMENTS:
-// 1. Client-side table formatting (instant instead of 2-4 seconds)
-// 2. Minimal AI call only for natural intro sentence
-// 3. Reduced token count (50 tokens vs 1500+)
-// 4. Optional streaming for even faster perceived performance
+function buildList(flatRows, totalFound) {
+  const SHOW = 8;
+  const shown = flatRows.slice(0, SHOW);
+  const remaining = totalFound - shown.length;
+
+  const parts = shown.map((r) => {
+    const segments = [];
+    const loc = locationStr(r);
+    if (loc) segments.push(`who lives in ${loc}`);
+    const deg = degreeShort(r["Education"]);
+    if (deg) segments.push(`with education in ${deg}`);
+    if (r["Skills"] && r["Skills"] !== "—") segments.push(`and skills in ${r["Skills"]}`);
+    const role = currentRole(r["Experience"]);
+    if (role) segments.push(`currently working as ${role}`);
+    if (r["Shortlisted"] === "Yes") segments.push("shortlisted");
+    if (r["Accepted"] === "Yes") segments.push("accepted");
+    return `**${r["Name"]}**${segments.length ? ", " + segments.join(", ") : ""}`;
+  });
+
+  if (remaining > 0) parts.push(`and **${remaining} more candidate${remaining > 1 ? "s" : ""}**`);
+  return parts.join("; ") + ".";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPE 2 — SKILLS_ONLY
+// Focused single-field answer. Reads from whatever field the question asked about.
+// ─────────────────────────────────────────────────────────────────────────────
+function buildSkillsOnly(flatRows, totalFound, sectionsNeeded) {
+  // Determine which field to feature based on requested sections
+  const sec = Array.isArray(sectionsNeeded) ? sectionsNeeded : [];
+  const featuredField = sec.includes("Skills")                  ? "Skills"
+    : sec.includes("Education")                                  ? "Education"
+    : sec.includes("Experience")                                 ? "Experience"
+    : sec.includes("Applications.Interviews")                    ? "Interview Details"
+    : sec.includes("Applications")                               ? "Jobs Applied"
+    : sec.includes("Documents")                                  ? "Documents Uploaded"
+    : sec.includes("Resumes")                                    ? "Resumes Uploaded"
+    : "Skills"; // fallback
+
+  const fieldLabel = {
+    "Skills":            "skills in",
+    "Education":         "education:",
+    "Experience":        "experience at",
+    "Interview Details": "interview details:",
+    "Jobs Applied":      "applied for",
+    "Documents Uploaded":"documents uploaded:",
+    "Resumes Uploaded":  "resumes uploaded:",
+  }[featuredField] || "details:";
+
+  // Check if multiple candidates share the same name — if so, add a
+  // disambiguator (city or email) so the user knows which is which.
+  const nameCounts = {};
+  flatRows.forEach((r) => {
+    nameCounts[r["Name"]] = (nameCounts[r["Name"]] || 0) + 1;
+  });
+
+  const lines = flatRows.map((r) => {
+    const val = r[featuredField];
+
+    // Build a disambiguated label when name is not unique
+    let label = `**${r["Name"]}**`;
+    if (nameCounts[r["Name"]] > 1) {
+      const disambig = r["City"] && r["City"] !== "—"
+        ? r["City"]
+        : r["Email"] && r["Email"] !== "—"
+        ? r["Email"]
+        : null;
+      if (disambig) label = `**${r["Name"]}** (${disambig})`;
+    }
+
+    if (!val || val === "—")
+      return `${label} has no ${featuredField.toLowerCase()} recorded.`;
+    return `${label} has ${fieldLabel} ${val}.`;
+  });
+
+  const hidden = totalFound - flatRows.length;
+  const footer = hidden > 0 ? `\n\n*Showing ${flatRows.length} of ${totalFound} candidates.*` : "";
+  return lines.join("\n") + footer;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPE 3 — FULL_DETAILS
+// Complete prose profile per candidate. Used when ≤ 3 candidates match.
+// ─────────────────────────────────────────────────────────────────────────────
+function buildFullDetails(flatRows) {
+  // Check for duplicate names — add email as disambiguator if needed
+  const nameCounts = {};
+  flatRows.forEach((r) => { nameCounts[r["Name"]] = (nameCounts[r["Name"]] || 0) + 1; });
+
+  const profiles = flatRows.map((r) => {
+    const sentences = [];
+
+    // Identity + location (with disambiguator if name is shared)
+    const loc = locationStr(r);
+    const nameLabel = nameCounts[r["Name"]] > 1 && r["Email"] && r["Email"] !== "—"
+      ? `**${r["Name"]}** (${r["Email"]})`
+      : `**${r["Name"]}**`;
+    sentences.push(`${nameLabel}${loc ? ` lives in ${loc}` : ""}.`);
+
+    // Contact
+    if (r["Email"] && r["Email"] !== "—") sentences.push(`Email: ${r["Email"]}, Phone: ${r["Phone"] || "—"}.`);
+
+    // Education
+    if (r["Education"] && r["Education"] !== "—")
+      sentences.push(`Education: ${r["Education"]}.`);
+
+    // Skills
+    if (r["Skills"] && r["Skills"] !== "—")
+      sentences.push(`Skills: ${r["Skills"]}.`);
+
+    // Experience
+    if (r["Experience"] && r["Experience"] !== "—") {
+      sentences.push(`Experience: ${r["Experience"]}.`);
+    } else {
+      sentences.push("No work experience listed.");
+    }
+
+    // Applications
+    if (r["Jobs Applied"] && r["Jobs Applied"] !== "—")
+      sentences.push(`Applied for: ${r["Jobs Applied"]}.`);
+    if (r["Shortlisted"] === "Yes") sentences.push("Currently shortlisted ✓.");
+    if (r["Accepted"] === "Yes") sentences.push("Offer accepted ✓.");
+
+    // Interview
+    if (r["Interview Details"] && r["Interview Details"] !== "—")
+      sentences.push(`Interview: ${r["Interview Details"].replace(/\n/g, " | ")}.`);
+    else if (r["Interview Status"] && r["Interview Status"] !== "—")
+      sentences.push(`Interview status: ${r["Interview Status"]}.`);
+
+    // Best marks
+    if (r["Best Marks"] && r["Best Marks"] !== "—")
+      sentences.push(`Best marks: ${r["Best Marks"]}.`);
+
+    // Documents
+    if (r["Documents Uploaded"] && r["Documents Uploaded"] !== "—")
+      sentences.push(`Documents: ${r["Documents Uploaded"]}.`);
+
+    return sentences.join(" ");
+  });
+
+  return profiles.join("\n\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPE 4 — COMPARE
+// Side-by-side prose comparison. Focuses on differences.
+// ─────────────────────────────────────────────────────────────────────────────
+function buildCompare(flatRows, totalFound) {
+  // Only compare first 4 for readability
+  const compared = flatRows.slice(0, 4);
+  const remaining = totalFound - compared.length;
+
+  const lines = [];
+
+  // Education comparison
+  const eduDiff = compared.some((r) => r["Education"] !== compared[0]["Education"]);
+  if (eduDiff) {
+    const eduParts = compared.map((r) => `**${r["Name"]}** has ${degreeShort(r["Education"]) || "no degree listed"}`);
+    lines.push(eduParts.join(", while ") + ".");
+  }
+
+  // Skills comparison
+  const skillParts = compared.map((r) => {
+    const s = r["Skills"] && r["Skills"] !== "—" ? r["Skills"] : "no skills listed";
+    return `**${r["Name"]}** has skills in ${s}`;
+  });
+  lines.push(skillParts.join(", while ") + ".");
+
+  // Experience comparison
+  const expParts = compared.map((r) => {
+    const role = currentRole(r["Experience"]);
+    return role
+      ? `**${r["Name"]}** is currently working as ${role}`
+      : `**${r["Name"]}** has no current role listed`;
+  });
+  if (expParts.length > 0) lines.push(expParts.join(", whereas ") + ".");
+
+  // Location comparison
+  const locDiff = compared.some((r) => locationStr(r) !== locationStr(compared[0]));
+  if (locDiff) {
+    const locParts = compared.map((r) => {
+      const loc = locationStr(r);
+      return `**${r["Name"]}** is from ${loc || "unknown location"}`;
+    });
+    lines.push(locParts.join(" and ") + ".");
+  }
+
+  // Shortlisted / Accepted status
+  const statusParts = compared
+    .filter((r) => r["Shortlisted"] === "Yes" || r["Accepted"] === "Yes")
+    .map((r) => {
+      if (r["Accepted"] === "Yes") return `**${r["Name"]}** has been accepted`;
+      return `**${r["Name"]}** is shortlisted`;
+    });
+  if (statusParts.length) lines.push(statusParts.join(", and ") + ".");
+
+  // Best marks if available
+  const marksParts = compared
+    .filter((r) => r["Best Marks"] && r["Best Marks"] !== "—")
+    .map((r) => `**${r["Name"]}** scored ${r["Best Marks"]}`);
+  if (marksParts.length > 1) lines.push(marksParts.join(" while ") + ".");
+
+  if (remaining > 0)
+    lines.push(`*${remaining} more candidate${remaining > 1 ? "s" : ""} not shown. Generate a report for the full list.*`);
+
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPE 5 — SUMMARY
+// Aggregated insight paragraph for large result sets (> 10 candidates).
+// ─────────────────────────────────────────────────────────────────────────────
+function buildSummary(flatRows, totalFound) {
+  const total = totalFound;
+
+  // Top skills — count frequency
+  const skillFreq = {};
+  flatRows.forEach((r) => {
+    if (Array.isArray(r["_allSkills"])) {
+      r["_allSkills"].forEach((s) => {
+        skillFreq[s] = (skillFreq[s] || 0) + 1;
+      });
+    }
+  });
+  const topSkills = Object.entries(skillFreq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([s]) => s);
+
+  // Education breakdown
+  const hasUG = flatRows.filter((r) => r["Education"] && r["Education"].includes("UG:")).length;
+  const hasPG = flatRows.filter((r) => r["Education"] && r["Education"].includes("PG:")).length;
+
+  // Experience
+  const hasExp = flatRows.filter((r) => r["Experience"] && r["Experience"] !== "—").length;
+  const noExp  = flatRows.length - hasExp;
+
+  // Shortlisted / Accepted
+  const shortlisted = flatRows.filter((r) => r["Shortlisted"] === "Yes").length;
+  const accepted    = flatRows.filter((r) => r["Accepted"]    === "Yes").length;
+
+  // Location spread
+  const cities = [...new Set(flatRows.map((r) => r["City"]).filter((c) => c && c !== "—"))];
+
+  const lines = [];
+
+  // Opening
+  lines.push(`Out of **${total} candidates** found:`);
+
+  // Skills insight
+  if (topSkills.length > 0)
+    lines.push(`• Most common skills are **${topSkills.join(", ")}**.`);
+
+  // Education insight
+  if (hasUG > 0 || hasPG > 0) {
+    const eduParts = [];
+    if (hasUG > 0) eduParts.push(`${hasUG} have an undergraduate degree`);
+    if (hasPG > 0) eduParts.push(`${hasPG} have a postgraduate degree`);
+    lines.push(`• ${eduParts.join(", and ")}.`);
+  }
+
+  // Experience insight
+  if (hasExp > 0 || noExp > 0) {
+    lines.push(`• **${hasExp}** have work experience, **${noExp}** are freshers.`);
+  }
+
+  // Application status
+  if (shortlisted > 0) lines.push(`• **${shortlisted}** are shortlisted${accepted > 0 ? `, **${accepted}** have been accepted` : ""}.`);
+
+  // Location spread
+  if (cities.length > 0) {
+    const cityStr = cities.length <= 4
+      ? cities.join(", ")
+      : `${cities.slice(0, 4).join(", ")} and ${cities.length - 4} more cities`;
+    lines.push(`• Candidates are from **${cityStr}**.`);
+  }
+
+  // Footer
+  const shown = flatRows.length;
+  if (shown < total)
+    lines.push(`\n*Showing summary based on ${shown} of ${total} candidates. Generate a report for full details.*`);
+
+  return lines.join("\n");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// formatTable — used only when user explicitly asks for table/compare in table
+// ═════════════════════════════════════════════════════════════════════════════
+function formatTable(flatRows, options = {}) {
+  const { totalFound = flatRows.length, isSingleCandidate = false, sectionsNeeded = null } = options;
+  if (flatRows.length === 0) return null;
+
+  let priorityCols;
+  if (isSingleCandidate && Array.isArray(sectionsNeeded) && sectionsNeeded.length > 0) {
+    priorityCols = getColumnsForSections(sectionsNeeded);
+  } else {
+    priorityCols = isSingleCandidate ? DETAIL_COLUMNS : [
+      "Name", "City", "State", "Skills", "Education", "Experience",
+      "Jobs Applied", "Application Status", "Shortlisted", "Accepted",
+      "Best Marks", "Interview Status",
+    ];
+  }
+
+  const usedKeys = priorityCols.filter((k) =>
+    flatRows.some((r) => r[k] && r[k] !== "—" && !k.startsWith("_")),
+  );
+  if (usedKeys.length === 0) return null;
+
+  const headers   = usedKeys.join(" | ");
+  const separator = usedKeys.map(() => "---").join(" | ");
+  const rows = flatRows
+    .map((row) => usedKeys.map((k) => String(row[k] || "—").replace(/\n/g, "<br>")).join(" | "))
+    .join("\n");
+
+  const hidden = totalFound - flatRows.length;
+  const footer = hidden > 0
+    ? `\n\n*Showing ${flatRows.length} of ${totalFound}. Generate a report for all results.*`
+    : "";
+
+  return `${headers}\n${separator}\n${rows}${footer}`;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// generateNaturalAnswer — MAIN EXPORT
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Automatically picks the best response type for every query.
+// Streams via onChunk if provided, otherwise returns full string.
 //
 export async function generateNaturalAnswer(
   question,
   sqlQuery,
   rows,
   options = {},
+  onChunk = null,
 ) {
   const client = getOpenAIClient();
 
+  // ── No data ───────────────────────────────────────────────────────────────
   if (!rows || rows.length === 0) {
-    return "No records found matching your query.";
+    const msg = "No records found matching your query.";
+    if (onChunk) await onChunk(msg);
+    return msg;
   }
 
-  const { userLimit = null, totalFound = rows.length } = options;
+  const {
+    userLimit    = null,
+    totalFound   = rows.length,
+    isSingleCandidate = false,
+    sectionsNeeded    = null,
+  } = options;
 
-  // Flatten every candidate into a clean display object
-  const flatRows = rows.map(flattenCandidateForDisplay);
+  // ── Detect response type ──────────────────────────────────────────────────
+  const responseType = detectResponseType(question, isSingleCandidate, totalFound, sectionsNeeded);
+  log.info(`[ResponseType] ${responseType} | totalFound: ${totalFound} | isSingle: ${isSingleCandidate} | sections: ${JSON.stringify(sectionsNeeded)}`);
 
-  // Remove keys that are all "—" / empty across every row
-  const allKeys = [...new Set(flatRows.flatMap((r) => Object.keys(r)))];
-  const usedKeys = allKeys.filter((k) =>
-    flatRows.some((r) => r[k] && r[k] !== "—"),
+  // ── Flatten rows with the right mode ─────────────────────────────────────
+  // "detail"  → all fields (FULL_DETAILS, SKILLS_ONLY with section filter)
+  // "summary" → summary fields (LIST, COMPARE, SUMMARY)
+  const flatMode = (responseType === "FULL_DETAILS" || responseType === "SKILLS_ONLY")
+    ? "detail"
+    : "summary";
+
+  const flatRows = rows.map((r) =>
+    flattenCandidate(
+      r,
+      flatMode,
+      // Pass sectionsNeeded only for SKILLS_ONLY so only the asked field is populated
+      responseType === "SKILLS_ONLY" ? sectionsNeeded : null,
+    )
   );
-  const cleanRows = flatRows.map((r) =>
-    Object.fromEntries(usedKeys.map((k) => [k, r[k] ?? "—"])),
-  );
 
-  const displayCount = cleanRows.length;
-  const hiddenCount = totalFound - displayCount;
+  const displayCount = flatRows.length;
+  const hiddenCount  = totalFound - displayCount;
 
-  // Format table client-side (instant!)
-  const table = formatCandidatesAsMarkdown(cleanRows, { totalFound });
+  // ── Build the body (sync, instant, zero extra AI cost) ────────────────────
+  let body;
+  switch (responseType) {
+    case "LIST":
+      body = buildList(flatRows, totalFound);
+      break;
+    case "SKILLS_ONLY":
+      body = buildSkillsOnly(flatRows, totalFound, sectionsNeeded);
+      break;
+    case "FULL_DETAILS":
+      body = buildFullDetails(flatRows);
+      break;
+    case "COMPARE":
+      body = buildCompare(flatRows, totalFound);
+      break;
+    case "SUMMARY":
+      body = buildSummary(flatRows, totalFound);
+      break;
+    default:
+      body = buildList(flatRows, totalFound);
+  }
 
-  // Use AI only for a natural intro sentence (much faster)
-  const systemPrompt = `You are a helpful HR assistant. Write ONE brief, friendly intro sentence that summarizes what was found. Keep it under 20 words.`;
+  // ── AI intro sentence (short, contextual, streamed first) ─────────────────
+  // Intro is tailored per response type so it feels natural
+  const introGuide = {
+    LIST:        "Write a short intro like 'Here are the candidates I found:' or similar. Under 15 words.",
+    SKILLS_ONLY: "Write a short intro referencing what was asked. Under 15 words.",
+    FULL_DETAILS:"Write a short intro for a candidate profile. Under 15 words.",
+    COMPARE:     "Write a short intro for a comparison. Under 15 words.",
+    SUMMARY:     "Write a short intro for a summary overview. Under 15 words.",
+  }[responseType] || "Write a short intro. Under 15 words.";
 
-  const userPrompt = `User asked: "${question}"
-Found: ${displayCount} candidate${displayCount !== 1 ? "s" : ""}${hiddenCount > 0 ? ` (${totalFound} total match, showing ${displayCount})` : ""}
+  const systemPrompt = `You are a helpful HR assistant. ${introGuide} No markdown.`;
+  const userPrompt = `User asked: "${question}"\nFound: ${displayCount} candidate${displayCount !== 1 ? "s" : ""}${hiddenCount > 0 ? ` (${totalFound} total)` : ""}.\nWrite the intro sentence only.`;
 
-Write a brief intro sentence only.`;
+  // ── STREAMING ─────────────────────────────────────────────────────────────
+  if (onChunk) {
+    try {
+      const stream = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 40,
+        stream: true,
+      });
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content || "";
+        if (token) await onChunk(token);
+      }
+      await onChunk("\n\n" + body);
+    } catch (err) {
+      log.error("Streaming intro error:", err);
+      await onChunk(`Found ${displayCount} candidate${displayCount !== 1 ? "s" : ""} matching your query.\n\n` + body);
+    }
+    return null;
+  }
 
+  // ── NON-STREAMING ─────────────────────────────────────────────────────────
   try {
     const resp = await client.chat.completions.create({
       model: "gpt-4o-mini",
@@ -425,15 +791,12 @@ Write a brief intro sentence only.`;
         { role: "user", content: userPrompt },
       ],
       temperature: 0.3,
-      max_tokens: 50, // Reduced from 1500!
+      max_tokens: 40,
     });
-
     const intro = (resp.choices[0].message.content || "").trim();
-    return `${intro}\n\n${table}`;
-  } catch (error) {
-    log.error("Error generating intro:", error);
-    // Fallback to simple intro if AI fails
-    const fallbackIntro = `Found ${displayCount} candidate${displayCount !== 1 ? "s" : ""} matching your query:`;
-    return `${fallbackIntro}\n\n${table}`;
+    return `${intro}\n\n${body}`;
+  } catch (err) {
+    log.error("Intro generation error:", err);
+    return `Found ${displayCount} candidate${displayCount !== 1 ? "s" : ""} matching your query.\n\n${body}`;
   }
 }

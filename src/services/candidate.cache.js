@@ -1,61 +1,14 @@
 // ============================================================
 // candidate.cache.js
-// Location: src/services/candidate.cache.js
-//
-// Structured Data RAG for sp_GetAllCandidateDetails_Full
-//
-// ─────────────────────────────────────────────────────────────
-// DESIGN: ONE smart LLM call (analyzeQuestion) handles all:
-//   • intent   — CANDIDATE / COUNT / PDF / REPORT / OOS
-//   • entities — name, city, skill, jobTitle, companyName...
-//   • filters  — every filterable column from the SP
-//   • sections — which SP sections to project
-//
-// All filtering runs in JS on the in-memory cache.
-// The answer LLM only receives pre-filtered, pre-projected data.
-//
-// BUG FIXES APPLIED:
-//   [FIX-1] MAX_CANDIDATES_TO_LLM no longer slices before COUNT —
-//           filterCandidates() returns the full matched pool;
-//           slicing to MAX_CANDIDATES_TO_LLM happens only when
-//           projecting data to send to the answer LLM.
-//
-//   [FIX-2] hasExperience / isCurrentlyWorking now ignore
-//           empty-company placeholder rows
-//           (companyName === "" counts as no experience).
-//
-//   [FIX-3] matchesEntity() now uses AND logic across all
-//           supplied entities instead of OR, so
-//           "Python developers from Ahmedabad" correctly
-//           requires BOTH skill=Python AND city=Ahmedabad.
-//
-//   [FIX-4] Name list sent to analyzeQuestion is capped at
-//           3 000 characters (not raw .slice(0,300)) to
-//           prevent prompt-size blowout at scale.
-//
-//   [FIX-5] "5 candidates with X" was wrongly classified as
-//           COUNT because of the leading number.
-//           — analyzeQuestion now extracts a `limit` field
-//             (number or null) from the question.
-//           — INTENT rules in the prompt are tightened:
-//             COUNT = only "how many / total / count" phrasing.
-//             A number like "5" before a noun = CANDIDATE+limit.
-//           — answerFromCache applies `limit` as a post-filter
-//             slice BEFORE the MAX_CANDIDATES_TO_LLM cap, so
-//             "show me 5 freshers" returns exactly 5 rows.
-//           — filters that were null but implied by context
-//             are also corrected: "5 candidates with interview
-//             status" now sets hasInterview:true automatically.
 
 import { getPool } from "../db/connection.js";
-import { getOpenAIClient,generateNaturalAnswer } from "./ai.service.js";
-// import { generateNaturalAnswer } from "./ai.service.js";
+import { getOpenAIClient, generateNaturalAnswer } from "./ai.service.js";
 import { log } from "../utils/logger.js";
 
 const SP_NAME = "dbo.sp_GetAllCandidateDetails_Full";
 const CACHE_TTL_MS = 30 * 60 * 1000;
-const MAX_CANDIDATES_TO_LLM = 50; // cap only for answer-LLM payload, NOT for filtering/counting
-const NAME_LIST_CHAR_CAP = 3000; // [FIX-4] hard character limit for name list in prompt
+const MAX_CANDIDATES_TO_LLM = 50;
+const NAME_LIST_CHAR_CAP = 3000;
 
 const ALL_SECTIONS = [
   "root",
@@ -90,7 +43,25 @@ export async function warmUp() {
   }
 }
 
-export async function answerFromCache(question) {
+// ─────────────────────────────────────────────────────────────────────────────
+// answerFromCache
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// onChunk — optional async (text: string) => void streaming callback.
+//           When provided the answer is streamed token-by-token directly to
+//           the caller (e.g. the HTTP response).  The `answer` field in the
+//           returned object will be null in this mode — the caller should NOT
+//           try to send it again.
+//           When omitted the full answer string is returned in result.answer
+//           (backward-compatible non-streaming behaviour).
+//
+export async function answerFromCache(question, options = {}) {
+  // Support both calling conventions:
+  //   answerFromCache(q, { onChunk })  ← chatbot.service.js
+  //   answerFromCache(q, fn)           ← legacy direct callback
+  const onChunk = typeof options === "function"
+    ? options
+    : (options?.onChunk ?? null);
   if (!candidateStore) {
     log.warn("Cache cold — triggering warm-up");
     await warmUp();
@@ -106,6 +77,11 @@ export async function answerFromCache(question) {
 
   // Step 1: single LLM call — routing + entities + filters + sections
   const analysis = await analyzeQuestion(question, candidateStore.candidates);
+
+  // Post-analysis fix: override OOS intent for known patterns the LLM
+  // misclassifies. These are all clearly candidate data queries.
+  fixMisclassifiedIntent(analysis, question);
+
   log.info(`[Step 1] Analysis: ${JSON.stringify(analysis)}`);
 
   // Non-candidate → signal router
@@ -120,25 +96,27 @@ export async function answerFromCache(question) {
 
   // interviewRound not in SP — give clear message
   if (analysis.filters?.interviewRound) {
+    const msg =
+      `The interview round type (e.g. "Coding Round", "HR Round") is not stored in the database — only interview **status** is tracked.\n\n` +
+      `You can filter by status instead:\n` +
+      `- **Completed** — *"candidates whose interview is completed"*\n` +
+      `- **Scheduled** — *"candidates with scheduled interviews"*\n` +
+      `- **In Progress** — *"candidates with interview in progress"*\n` +
+      `- **Postponed** — *"candidates with postponed interviews"*\n` +
+      `- **Cancelled** — *"candidates with cancelled interviews"*`;
+
+    if (onChunk) await onChunk(msg);
+
     return {
       success: true,
       type: "CACHE",
       dataframe: [],
       cachedAt: candidateStore.cachedAt,
-      answer:
-        `The interview round type (e.g. "Coding Round", "HR Round") is not stored in the database — only interview **status** is tracked.\n\n` +
-        `You can filter by status instead:\n` +
-        `- **Completed** — *"candidates whose interview is completed"*\n` +
-        `- **Scheduled** — *"candidates with scheduled interviews"*\n` +
-        `- **In Progress** — *"candidates with interview in progress"*\n` +
-        `- **Postponed** — *"candidates with postponed interviews"*\n` +
-        `- **Cancelled** — *"candidates with cancelled interviews"*`,
+      answer: onChunk ? null : msg,
     };
   }
 
   // ── COUNT intent ────────────────────────────────────────────────────────
-  // [FIX-1] filterCandidates() now returns the FULL matched pool (no slice).
-  //         COUNT therefore reflects the real number, not a capped subset.
   if (analysis.intent === "COUNT") {
     const hasEntity = Object.values(analysis.entities || {}).some(
       (v) => v != null && v !== "",
@@ -149,16 +127,17 @@ export async function answerFromCache(question) {
 
     if (!hasEntity && !hasFilter) {
       const total = candidateStore.candidates.length;
+      const msg = `There are currently **${total}** candidate${total !== 1 ? "s" : ""} registered in the system (as of ${candidateStore.cachedAt.toLocaleString()}).`;
+      if (onChunk) await onChunk(msg);
       return {
         success: true,
         type: "CACHE_COUNT",
         dataframe: [],
         cachedAt: candidateStore.cachedAt,
-        answer: `There are currently **${total}** candidate${total !== 1 ? "s" : ""} registered in the system (as of ${candidateStore.cachedAt.toLocaleString()}).`,
+        answer: onChunk ? null : msg,
       };
     }
 
-    // Full unsliced pool — accurate count
     const countFiltered = filterCandidates(
       analysis.entities,
       analysis.filters || {},
@@ -167,50 +146,108 @@ export async function answerFromCache(question) {
 
     const label = buildFilterLabel(analysis.entities, analysis.filters || {});
     if (countFiltered.length === 0) {
+      const msg = `No candidates found ${label}.`;
+      if (onChunk) await onChunk(msg);
       return {
         success: true,
         type: "CACHE_COUNT",
         dataframe: [],
         cachedAt: candidateStore.cachedAt,
-        answer: `No candidates found ${label}.`,
+        answer: onChunk ? null : msg,
       };
     }
+
+    const msg = `There are **${countFiltered.length}** candidate${countFiltered.length !== 1 ? "s" : ""} ${label}.`;
+    if (onChunk) await onChunk(msg);
     return {
       success: true,
       type: "CACHE_COUNT",
       dataframe: [],
       cachedAt: candidateStore.cachedAt,
-      answer: `There are **${countFiltered.length}** candidate${countFiltered.length !== 1 ? "s" : ""} ${label}.`,
+      answer: onChunk ? null : msg,
     };
   }
 
   // ── CANDIDATE intent ─────────────────────────────────────────────────────
 
-  // Step 2: filter — returns full matched pool (no slice)  [FIX-1]
+  // Detect "highest marks" / "lowest marks" / "top scorer" intent.
+  // The LLM returns marksObtained: null for these because "highest" is not a
+  // numeric value — we handle it here with a sort instead of a filter.
+  const q = question.toLowerCase();
+  const isHighestMarks =
+    (q.includes("highest") || q.includes("top scorer") || q.includes("most marks") || q.includes("best marks")) &&
+    (q.includes("mark") || q.includes("score") || q.includes("marks"));
+  const isLowestMarks =
+    (q.includes("lowest") || q.includes("least marks") || q.includes("minimum marks")) &&
+    (q.includes("mark") || q.includes("score") || q.includes("marks"));
+
+  // Step 2: filter — returns full matched pool (no slice)
   const filtered = filterCandidates(analysis.entities, analysis.filters || {});
-  log.info(`[Step 2] Candidates after filter: ${filtered.length}`);
+  log.info(`[Step 2] Candidates after filter: ${filtered.length} | isHighestMarks: ${isHighestMarks} | isLowestMarks: ${isLowestMarks}`);
 
   if (filtered.length === 0) {
     const label = buildFilterLabel(analysis.entities, analysis.filters || {});
     const msg = analysis.entities?.candidateName
       ? `I couldn't find any candidate named "${analysis.entities.candidateName}". Please check the name and try again.`
       : `No candidates found ${label}.`;
+
+    if (onChunk) await onChunk(msg);
     return {
       success: true,
-      answer: msg,
+      answer: onChunk ? null : msg,
       dataframe: [],
       cachedAt: candidateStore.cachedAt,
     };
   }
 
+  // ── Highest / Lowest marks: sort the full pool by best marks, take top N ──
+  // This runs before slicing so we always show the genuinely top-scoring
+  // candidates, not just whoever happened to be first in the DB.
+  let sortedFiltered = filtered;
+  if (isHighestMarks || isLowestMarks) {
+    // Compute each candidate's best (max) marks across all interviews
+    const getBestMarks = (candidate) => {
+      const allMarks = (candidate.Applications || []).flatMap((app) =>
+        (app.Interviews || [])
+          .map((i) => i.marksObtained)
+          .filter((m) => m != null)
+          .map(Number),
+      );
+      return allMarks.length > 0 ? Math.max(...allMarks) : -1;
+    };
+
+    sortedFiltered = [...filtered].sort((a, b) => {
+      const marksA = getBestMarks(a);
+      const marksB = getBestMarks(b);
+      return isHighestMarks ? marksB - marksA : marksA - marksB;
+    });
+
+    // Remove candidates with no marks at all for highest/lowest queries
+    sortedFiltered = sortedFiltered.filter((c) => getBestMarks(c) >= 0);
+
+    log.info(`[Marks sort] ${isHighestMarks ? "Highest" : "Lowest"} marks sort applied — ${sortedFiltered.length} candidates with marks`);
+  }
+
   // Step 3: project
-  // [FIX-5] Apply user-requested limit FIRST (e.g. "show me 5 candidates"),
-  //         then cap at MAX_CANDIDATES_TO_LLM so we never blow the LLM context.
-  //         Priority: userLimit → MAX_CANDIDATES_TO_LLM
-  const sections =
-    analysis.sectionsNeeded === "ALL"
-      ? ALL_SECTIONS
-      : analysis.sectionsNeeded || ALL_SECTIONS;
+  // isSingleCandidate = true when the user asked about a specific person by
+  // name. Controls column set (summary vs full) and interview detail level.
+  const isSingleCandidate = !!(
+    analysis.entities?.candidateName &&
+    analysis.entities.candidateName.trim() !== ""
+  );
+
+  // Sections to project:
+  // • Single candidate + LLM gave specific sections (e.g. ["root","Skills"])
+  //   → use exactly those sections — "tell me skills of X" only needs Skills
+  // • Single candidate + LLM said "ALL" or gave nothing
+  //   → use ALL_SECTIONS (full profile view)
+  // • List query → use getSummarySections() (minimal relevant sections)
+  const llmSections = analysis.sectionsNeeded;
+  const sections = isSingleCandidate
+    ? (llmSections === "ALL" || !Array.isArray(llmSections)
+        ? ALL_SECTIONS
+        : llmSections)
+    : getSummarySections(analysis.filters || {}, llmSections);
 
   const userLimit =
     analysis.limit != null &&
@@ -223,21 +260,25 @@ export async function answerFromCache(question) {
     ? Math.min(userLimit, MAX_CANDIDATES_TO_LLM)
     : MAX_CANDIDATES_TO_LLM;
 
-  const slicedForLLM = filtered.slice(0, effectiveCap);
+  const slicedForLLM = sortedFiltered.slice(0, effectiveCap);
   const projected = projectData(slicedForLLM, sections);
   log.info(
-    `[Step 3] Sections: ${JSON.stringify(sections)} — userLimit: ${userLimit ?? "none"} — sending ${projected.length} of ${filtered.length} candidates to LLM`,
+    `[Step 3] isSingleCandidate: ${isSingleCandidate} | Sections: ${JSON.stringify(sections)} — userLimit: ${userLimit ?? "none"} — sending ${projected.length} of ${filtered.length} candidates to LLM`,
   );
 
   // Step 4: answer
-  // Pass userLimit + totalFound so generateNaturalAnswer can:
-  //   • tell the LLM "show exactly N candidates, one row each"
-  //   • add a "X more results" footer when totalFound > shownToLLM
+  // Pass isSingleCandidate so generateNaturalAnswer picks the right column set.
   const answer = await generateNaturalAnswer(
     question,
     `${SP_NAME} (cached at ${candidateStore.cachedAt.toLocaleString()})`,
     projected,
-    { userLimit, totalFound: filtered.length },
+    {
+      userLimit,
+      totalFound: (isHighestMarks || isLowestMarks) ? sortedFiltered.length : filtered.length,
+      isSingleCandidate,
+      sectionsNeeded: sections, // tells ai.service.js which fields to show
+    },
+    onChunk,
   );
 
   return {
@@ -246,11 +287,12 @@ export async function answerFromCache(question) {
     answer,
     dataframe: projected,
     cachedAt: candidateStore.cachedAt,
-    totalFound: filtered.length, // real total, not capped
-    shownToLLM: projected.length, // how many were actually sent to LLM
-    userLimit: userLimit ?? null, // [FIX-5] the limit the user asked for
+    totalFound: (isHighestMarks || isLowestMarks) ? sortedFiltered.length : filtered.length,
+    shownToLLM: projected.length,
+    userLimit: userLimit ?? null,
     sectionsUsed: sections,
     entities: analysis.entities,
+    isSingleCandidate,
   };
 }
 
@@ -337,15 +379,138 @@ function scheduleAutoRefresh() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// fixMisclassifiedIntent
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixes cases where analyzeQuestion returns OOS/PDF for queries that are
+// clearly about candidate data. Mutates the analysis object in place.
+//
+// These patterns are reliably misclassified by gpt-4o-mini:
+//   • birthdate / age range queries → CANDIDATE + birthYear filters
+//   • graduation year queries        → CANDIDATE + ugGraduationYear filter
+//   • interviewer queries            → CANDIDATE + interviewer filter
+//
+function fixMisclassifiedIntent(analysis, question) {
+  const q = question.toLowerCase();
+
+  // ── Birthdate / age range ─────────────────────────────────────────────────
+  const birthdatePatterns = [
+    /birth\s*date/i, /date\s*of\s*birth/i, /dob/i,
+    /born\s*(in|between|after|before|from)/i,
+    /age\s*(between|from|above|below|under|over)/i,
+    /born\s*\d{4}/i,
+  ];
+  const hasBirthdatePattern = birthdatePatterns.some((r) => r.test(question));
+
+  // Also detect "between YEAR to/and YEAR" or "from YEAR to YEAR"
+  const yearRangeMatch = question.match(
+    /(?:between|from)\s+(\d{4})\s+(?:to|and|-)\s+(\d{4})/i
+  );
+
+  if (hasBirthdatePattern || (yearRangeMatch && q.includes("birth"))) {
+    if (analysis.intent === "OOS" || analysis.intent === "PDF") {
+      analysis.intent = "CANDIDATE";
+      log.info(`[IntentFix] Birthdate query overridden → CANDIDATE`);
+    }
+    // Always set Profile section for birthdate queries
+    if (!Array.isArray(analysis.sectionsNeeded) || !analysis.sectionsNeeded.includes("Profile")) {
+      analysis.sectionsNeeded = ["root", "Profile"];
+    }
+
+    // ALWAYS overwrite birthYear filters from question text — never trust
+    // the LLM values which can be swapped or wrong for range queries.
+    if (yearRangeMatch) {
+      const y1 = parseInt(yearRangeMatch[1], 10);
+      const y2 = parseInt(yearRangeMatch[2], 10);
+      // Always assign smaller year to From, larger to To regardless of order
+      analysis.filters.birthYearFrom = Math.min(y1, y2);
+      analysis.filters.birthYearTo   = Math.max(y1, y2);
+      // Clear conflicting single year
+      analysis.filters.birthYear = null;
+      log.info(`[IntentFix] birthYearFrom: ${analysis.filters.birthYearFrom}, birthYearTo: ${analysis.filters.birthYearTo}`);
+    } else {
+      // Single year — extract from question, e.g. "born in 2001", "birthdate 2001"
+      const allYears = [...question.matchAll(/(19|20)\d{2}/g)].map((m) => parseInt(m[0], 10));
+      if (allYears.length === 1 && !analysis.filters.birthYear) {
+        analysis.filters.birthYear = allYears[0];
+        analysis.filters.birthYearFrom = null;
+        analysis.filters.birthYearTo   = null;
+        log.info(`[IntentFix] birthYear: ${analysis.filters.birthYear}`);
+      }
+    }
+  }
+
+  // ── Graduation year — "completed study in YEAR" / "graduated in YEAR" ─────
+  const gradPatterns = [
+    /complet\w*\s+(?:their\s+)?study/i,
+    /graduat\w*\s+in\s+\d{4}/i,
+    /passed\s+out\s+in\s+\d{4}/i,
+    /finish\w*\s+(?:their\s+)?(?:study|education|degree)\s+in\s+\d{4}/i,
+  ];
+  if (gradPatterns.some((r) => r.test(question))) {
+    if (analysis.intent === "OOS" || analysis.intent === "PDF") {
+      analysis.intent = "CANDIDATE";
+      analysis.sectionsNeeded = ["root", "Profile", "Education"];
+      log.info(`[IntentFix] Graduation year query overridden → CANDIDATE`);
+    }
+    // Extract year if not already set
+    const yearMatch = question.match(/(19|20)\d{2}/);
+    if (yearMatch && !analysis.filters.ugGraduationYear) {
+      analysis.filters.ugGraduationYear = parseInt(yearMatch[0], 10);
+      analysis.filters.isStudying = null; // never set isStudying for grad year queries
+      log.info(`[IntentFix] ugGraduationYear: ${analysis.filters.ugGraduationYear}`);
+    }
+  }
+
+  // ── PDF / policy questions misclassified as OOS ──────────────────────────
+  // Detect HR policy/process questions that should go to PDF route
+  // HR/policy question keywords — any question containing these about HR topics
+  // should be PDF, never OOS
+  const pdfKeywords = [
+    "recruitment process", "recruitment management", "recruitment policy",
+    "hiring process", "hiring policy", "hiring procedure",
+    "interview process", "interview policy", "interview procedure",
+    "onboarding process", "onboarding policy", "pre-boarding", "pre boarding",
+    "selection process", "selection criteria", "selection policy",
+    "online communication training", "communication training",
+    "hr policy", "hr process", "hr procedure", "hr guideline",
+    "what is recruitment", "how does recruitment", "explain recruitment",
+    "what is hiring", "how does hiring", "explain hiring",
+    "what is interview", "how does interview", "explain interview",
+    "what is onboarding", "what is pre-boarding",
+  ];
+  const qLower = question.toLowerCase();
+  const isPdfQuestion = pdfKeywords.some((kw) => qLower.includes(kw));
+
+  if (analysis.intent === "OOS" && isPdfQuestion) {
+    analysis.intent = "PDF";
+    log.info(`[IntentFix] PDF policy question overridden from OOS → PDF`);
+  }
+
+  // ── Interviewer — "interview taken by X" / "interviewed by X" ─────────────
+  const interviewerMatch = question.match(
+    /(?:interview\w*\s+(?:taken\s+)?by|interviewed\s+by|interviewer\s+(?:is\s+)?)\s+(.+?)(?:\s*$|\s*\?)/i
+  );
+  if (interviewerMatch) {
+    if (analysis.intent === "OOS" || analysis.intent === "PDF") {
+      analysis.intent = "CANDIDATE";
+      analysis.sectionsNeeded = ["root", "Applications", "Applications.Interviews"];
+      log.info(`[IntentFix] Interviewer query overridden → CANDIDATE`);
+    }
+    if (!analysis.filters.interviewer) {
+      analysis.filters.interviewer = interviewerMatch[1].trim();
+      analysis.filters.hasInterview = true;
+      log.info(`[IntentFix] interviewer: "${analysis.filters.interviewer}"`);
+    }
+  }
+}
+
 // analyzeQuestion — THE SINGLE LLM CALL
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function analyzeQuestion(question, candidates) {
   const client = getOpenAIClient();
 
-  // [FIX-4] Cap name list by CHARACTER LENGTH, not by array index.
-  //         This prevents the prompt from blowing up at scale
-  //         (e.g. 500+ candidates × average 15 chars/name = 7 500+ chars).
   const nameList = candidates
     .map((c) => c.FullName)
     .filter(Boolean)
@@ -389,6 +554,9 @@ Return ONLY valid JSON — no markdown, no explanation.
     "universityName": string or null
   },
 
+  NOTE: gender, language, isStudying, isVerified and all boolean candidate
+  properties belong in "filters" NOT in "entities". Never put them in entities.
+
   "filters": {
     "isVerified":          boolean or null,
     "isProfileComplete":   boolean or null,
@@ -397,6 +565,9 @@ Return ONLY valid JSON — no markdown, no explanation.
     "languageKnown":       string or null,
     "hasLinkedin":         boolean or null,
     "hasPortfolio":        boolean or null,
+    "birthYearFrom":       number or null,
+    "birthYearTo":         number or null,
+    "birthYear":           number or null,
     "ugDegree":            string or null,
     "pgDegree":            string or null,
     "hasPostGraduation":   boolean or null,
@@ -412,6 +583,7 @@ Return ONLY valid JSON — no markdown, no explanation.
     "hasInterview":        boolean or null,
     "hasFeedback":         boolean or null,
     "interviewStatus":     string or null,
+    "interviewer":         string or null,
     "interviewRound":      string or null,
     "marksObtained":       number or null,
     "marksOperator":       "eq"|"gt"|"lt"|"gte"|"lte" or null,
@@ -424,7 +596,7 @@ Return ONLY valid JSON — no markdown, no explanation.
     "hasOfferLetter":      boolean or null,
     "hasItr":              boolean or null,
     "hasResume":           boolean or null,
-    "resumeCount":         number or null,    // exact/min/max number of resumes uploaded
+    "resumeCount":         number or null,
     "resumeCountOperator": "eq"|"gt"|"lt"|"gte"|"lte" or null
   },
 
@@ -452,15 +624,39 @@ CANDIDATE — everything else that returns a list or profile.
            "list all verified candidates"         → CANDIDATE, limit: null
            "candidates with Python skill"         → CANDIDATE, limit: null
            "tell me about Avinash"                → CANDIDATE, limit: null
+           "candidates born between 2000 and 2005" → CANDIDATE
+           "candidates with birthdate in 2001"    → CANDIDATE
+           "candidates born after 1995"           → CANDIDATE
+
+         IMPORTANT: Any question about candidate birthdate, date of birth,
+         or age range is CANDIDATE intent — never OOS.
 
 CRITICAL: If the question starts with or contains a number followed by
 "candidate(s)", "applicant(s)", "person(s)", "result(s)", or any noun
 that implies a list → intent is CANDIDATE, put that number in "limit".
 Never set intent to COUNT just because a number appears in the question.
 
-PDF    — company policy, HR documents, process guides
-REPORT — user wants to download/generate a report file
-OOS    — completely unrelated (weather, cooking, general knowledge)
+PDF    — questions about POLICIES, PROCESSES, GUIDELINES, or HR concepts.
+         These do NOT ask for specific data records.
+         Examples:
+           "what is the recruitment process?"
+           "explain the interview policy"
+           "how does hiring work?"
+           "what is pre-boarding?"
+           "what is online communication training?"
+           "what is Recruitment Management?"
+           "explain the onboarding process"
+           "what are the selection criteria?"
+           Any "what is", "how does", "explain", "describe" about HR/recruitment concepts.
+
+REPORT — user explicitly wants to download/generate a report file.
+         Examples: "generate a report", "export as PDF", "create a report of interviews"
+
+OOS    — COMPLETELY unrelated to recruitment, HR, candidates, or jobs.
+         Only use OOS for: weather, cooking, general knowledge, math, jokes.
+         Examples: "what is 2+2", "write a poem", "what is Python programming"
+         NOT OOS: anything about recruitment process, HR policies, candidates,
+         interviews, onboarding, job descriptions — these are PDF or CANDIDATE.
 
 ────────────────────────────────────────
 LIMIT RULES:
@@ -475,6 +671,11 @@ ENTITY RULES:
 - candidateName: match ANY name resembling one in the list (partial/lowercase/typo OK)
 - Extract city, state, skill, jobTitle, companyName when clearly mentioned
 - universityName: extract when user mentions a college, university, or institute name
+- NEVER put gender, language, isStudying, or any boolean property in entities.
+  Gender ("male","female") → filters.gender
+  Language ("hindi","english") → filters.languageKnown
+  "studying"/"working" → filters.isStudying
+  "verified" → filters.isVerified
     "users from Silver Oak"           → universityName: "Silver Oak"
     "candidates from GTU"             → universityName: "GTU"
     "students of MIT college"         → universityName: "MIT"
@@ -499,12 +700,32 @@ PROFILE:
   "no linkedin"                   → hasLinkedin: false
   "has portfolio/github"          → hasPortfolio: true
 
+BIRTHDATE / AGE:
+  "born in 2000"                  → birthYear: 2000
+  "birthdate between 2000 and 2005" → birthYearFrom: 2000, birthYearTo: 2005
+  "born between 2010 to 2020"     → birthYearFrom: 2010, birthYearTo: 2020
+  "candidates born after 2000"    → birthYearFrom: 2000
+  "candidates born before 1990"   → birthYearTo: 1990
+  "age between X and Y" → convert to birth years: birthYearFrom = currentYear-Y, birthYearTo = currentYear-X
+  IMPORTANT: birthdate queries are CANDIDATE intent, NOT OOS.
+
 EDUCATION:
   "B.Tech candidates"             → ugDegree: "B.Tech"
   "MBA candidates"                → pgDegree: "MBA"
-  "has masters/PG"                → hasPostGraduation: true
+  "M.Tech candidates"             → pgDegree: "MTech"
+  "master degree" / "masters"     → pgDegree: "Masters"  (NOT hasPostGraduation)
+  "has PG" / "has masters/PG"     → hasPostGraduation: true
   "no PG degree"                  → hasPostGraduation: false
-  "graduated in 2023"             → ugGraduationYear: 2023
+  "B.Tech candidates"             → ugDegree: "BTech"
+  "bachelor degree" / "bachelors" → ugDegree: "Bachelors"
+  "graduated in 2023" / "completed study in 2023" / "passed out in 2023"
+                                  → ugGraduationYear: 2023, isStudying: null (NOT false)
+  "completed PG in 2023"          → pgGraduationYear: 2023, isStudying: null
+  Do NOT set isStudying when a graduation year is mentioned.
+
+  IMPORTANT: When user mentions a specific degree type like "master degree",
+  "masters", "MBA", "M.Tech" → always use pgDegree, not hasPostGraduation.
+  hasPostGraduation is only for "has PG" / "has masters" without specifying type.
 
 EXPERIENCE:
   "currently working"             → isCurrentlyWorking: true
@@ -521,6 +742,8 @@ APPLICATIONS:
 
 INTERVIEWS:
   "with interview status" / "has interview" / "interview wale" → hasInterview: true
+  "interview taken by X" / "interviewed by X" / "interviewer is X" → interviewer: "X"
+  "system admin interview" / "taken by system admin" → interviewer: "system admin"
   "passed interview" / "qualified"→ isQualified: true
   "failed interview"              → isQualified: false
   "has feedback"                  → hasFeedback: true
@@ -595,7 +818,6 @@ JSON:`.trim();
       .replace(/\n?```$/, "");
     const parsed = JSON.parse(raw);
 
-    // [FIX-5] Safely extract limit — must be a positive integer
     const rawLimit = parsed.limit;
     const safeLimit =
       rawLimit != null &&
@@ -604,14 +826,74 @@ JSON:`.trim();
         ? Math.floor(Number(rawLimit))
         : null;
 
+    const rawEntities = parsed.entities || {};
+    const rawFilters  = parsed.filters  || {};
+
+    // ── Normalise misplaced fields ──────────────────────────────────────────
+    // The LLM sometimes puts filter-type values (gender, city, state, skill,
+    // language) inside "entities" instead of "filters".  Move them to the
+    // correct bucket so filterCandidates() picks them up.
+    const normEntities = { ...rawEntities };
+    const normFilters  = { ...rawFilters, interviewRound: rawFilters.interviewRound || null };
+
+    // gender → filters.gender
+    if (normEntities.gender != null && normEntities.gender !== "") {
+      normFilters.gender = normFilters.gender || normEntities.gender;
+      delete normEntities.gender;
+    }
+    // language → filters.languageKnown
+    if (normEntities.language != null && normEntities.language !== "") {
+      normFilters.languageKnown = normFilters.languageKnown || normEntities.language;
+      delete normEntities.language;
+    }
+    if (normEntities.languageKnown != null && normEntities.languageKnown !== "") {
+      normFilters.languageKnown = normFilters.languageKnown || normEntities.languageKnown;
+      delete normEntities.languageKnown;
+    }
+    // isStudying / isVerified / isProfileComplete → filters
+    ["isStudying","isVerified","isProfileComplete","hasExperience","isCurrentlyWorking",
+     "isShortlisted","isAccepted","hasInterview","hasResume"].forEach((key) => {
+      if (normEntities[key] != null) {
+        normFilters[key] = normFilters[key] ?? normEntities[key];
+        delete normEntities[key];
+      }
+    });
+
+    // interviewer → filters.interviewer
+    if (normEntities.interviewer != null && normEntities.interviewer !== "") {
+      normFilters.interviewer = normFilters.interviewer || normEntities.interviewer;
+      delete normEntities.interviewer;
+    }
+
+    // Also move any remaining filter-type keys that landed in entities by mistake.
+    // These are all the known filter keys — if any appear in entities, move them.
+    const FILTER_KEYS = [
+      "interviewer", "interviewStatus", "applicationStatus", "isQualified",
+      "hasFeedback", "marksObtained", "marksOperator", "hasAadhar", "hasPanCard",
+      "hasBankPassbook", "hasBankStatement", "hasSalarySlip", "hasExperienceLetter",
+      "hasOfferLetter", "hasItr", "resumeCount", "resumeCountOperator",
+      "hasLinkedin", "hasPortfolio", "ugDegree", "pgDegree", "hasPostGraduation",
+      "ugGraduationYear", "pgGraduationYear", "hasApplied",
+      "birthYear", "birthYearFrom", "birthYearTo",
+    ];
+    FILTER_KEYS.forEach((key) => {
+      if (normEntities[key] != null) {
+        normFilters[key] = normFilters[key] ?? normEntities[key];
+        delete normEntities[key];
+      }
+    });
+
+    // skill stays in entities (used by matchesEntity for skill matching)
+    // city / state stay in entities (used by matchesEntity for location matching)
+    // candidateName / email / jobTitle / companyName / universityName stay in entities
+
+    log.info(`[Normalised] entities: ${JSON.stringify(normEntities)} | filters: ${JSON.stringify(normFilters)}`);
+
     return {
       intent: parsed.intent || "CANDIDATE",
       limit: safeLimit,
-      entities: parsed.entities || {},
-      filters: {
-        ...(parsed.filters || {}),
-        interviewRound: parsed.filters?.interviewRound || null,
-      },
+      entities: normEntities,
+      filters: normFilters,
       sectionsNeeded: parsed.sectionsNeeded || "ALL",
     };
   } catch (err) {
@@ -631,9 +913,6 @@ JSON:`.trim();
 // ─────────────────────────────────────────────────────────────────────────────
 // FILTER CANDIDATES
 // ─────────────────────────────────────────────────────────────────────────────
-// [FIX-1] Returns the FULL matched pool — NO .slice() here.
-//         Slicing to MAX_CANDIDATES_TO_LLM is done in answerFromCache
-//         only for the LLM projection step, so COUNT is always accurate.
 
 function filterCandidates(entities, filters = {}) {
   if (!candidateStore) return [];
@@ -645,42 +924,56 @@ function filterCandidates(entities, filters = {}) {
     ? candidates.filter((c) => matchesEntity(c, entities))
     : candidates;
   if (hasFilter) pool = pool.filter((c) => matchesFilters(c, filters));
-  return pool; // full pool — no slice
+  return pool;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTITY MATCHING  [FIX-3]
+// ENTITY MATCHING  (AND logic — all supplied entities must match)
 // ─────────────────────────────────────────────────────────────────────────────
-// Previous version used OR: any entity match → include candidate.
-// This caused "Python developers from Ahmedabad" to return all Python
-// developers AND all Ahmedabad residents instead of the intersection.
-//
-// New version builds a checks[] array — one boolean per supplied entity —
-// and requires ALL checks to pass (AND logic).
 
 function matchesEntity(candidate, entities) {
   const checks = [];
 
-  // ── candidateName ────────────────────────────────────────────────────────
   if (entities.candidateName != null && entities.candidateName !== "") {
     const search = entities.candidateName.toLowerCase().trim();
     const fullName = (candidate.FullName || "").toLowerCase();
+
+    // Split search into words, keep all words (even short ones like "P.")
+    const words = search.split(/\s+/).filter((w) => w.length > 0);
+
+    // 1. Direct substring match — handles "naresh prajapati" → "Naresh Prajapati"
     const directMatch = fullName.includes(search);
-    const wordMatch = search
-      .split(/\s+/)
-      .filter((p) => p.length > 2)
-      .some((p) => fullName.includes(p));
-    checks.push(directMatch || wordMatch);
+
+    // 2. Multi-word AND match — ALL words must appear in the full name.
+    //    "naresh prajapati" → both "naresh" AND "prajapati" must be in the name.
+    //    This is the critical fix: prevents "Kalash Prajapati" from matching
+    //    when the user searched for "naresh prajapati".
+    //    Only meaningful words (length > 1) are required to all match.
+    const meaningfulWords = words.filter((w) => w.length > 1);
+    const multiWordMatch = meaningfulWords.length >= 2
+      && meaningfulWords.every((w) => fullName.includes(w));
+
+    // 3. Single-word search → partial match (e.g. "avinash" matches "Avinash Patel")
+    //    Only used when the user typed a single name token.
+    const singleWordMatch = meaningfulWords.length === 1
+      && fullName.includes(meaningfulWords[0]);
+
+    // Strict priority: direct match first, then multi-word AND, then single word.
+    // Never fall back to single-word if a multi-word search was given —
+    // that is what caused "Kalash Prajapati" to appear for "naresh prajapati".
+    const nameMatch = meaningfulWords.length >= 2
+      ? (directMatch || multiWordMatch)   // multi-word: require BOTH words
+      : (directMatch || singleWordMatch); // single-word: partial is fine
+
+    checks.push(nameMatch);
   }
 
-  // ── email ────────────────────────────────────────────────────────────────
   if (entities.email != null && entities.email !== "") {
     checks.push(
       (candidate.email || "").toLowerCase() === entities.email.toLowerCase(),
     );
   }
 
-  // ── city ─────────────────────────────────────────────────────────────────
   if (entities.city != null && entities.city !== "") {
     checks.push(
       (candidate.Profile?.city || "")
@@ -689,7 +982,6 @@ function matchesEntity(candidate, entities) {
     );
   }
 
-  // ── state ────────────────────────────────────────────────────────────────
   if (entities.state != null && entities.state !== "") {
     checks.push(
       (candidate.Profile?.state || "")
@@ -698,7 +990,6 @@ function matchesEntity(candidate, entities) {
     );
   }
 
-  // ── skill ────────────────────────────────────────────────────────────────
   if (entities.skill != null && entities.skill !== "") {
     const skills = (candidate.Skills || []).map((s) =>
       (s.Skill || "").toLowerCase(),
@@ -706,7 +997,6 @@ function matchesEntity(candidate, entities) {
     checks.push(skills.some((sk) => sk.includes(entities.skill.toLowerCase())));
   }
 
-  // ── jobTitle ─────────────────────────────────────────────────────────────
   if (entities.jobTitle != null && entities.jobTitle !== "") {
     const jobs = (candidate.Applications || []).map((a) =>
       (a.JobTitle || "").toLowerCase(),
@@ -724,7 +1014,6 @@ function matchesEntity(candidate, entities) {
     checks.push(jobMatch);
   }
 
-  // ── companyName ──────────────────────────────────────────────────────────
   if (entities.companyName != null && entities.companyName !== "") {
     const companies = (candidate.Experience || []).map((e) =>
       (e.companyName || "").toLowerCase(),
@@ -738,7 +1027,6 @@ function matchesEntity(candidate, entities) {
     checks.push(companyMatch);
   }
 
-  // ── universityName ───────────────────────────────────────────────────────
   if (entities.universityName != null && entities.universityName !== "") {
     const uniQuery = entities.universityName.toLowerCase().trim();
     const edu = candidate.Education || [];
@@ -760,17 +1048,8 @@ function matchesEntity(candidate, entities) {
     checks.push(uniMatch);
   }
 
-  // All supplied entities must match (AND logic)
   return checks.length === 0 ? false : checks.every(Boolean);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// VALUE FILTERS  [FIX-2]
-// ─────────────────────────────────────────────────────────────────────────────
-// hasExperience and isCurrentlyWorking previously counted placeholder rows
-// where companyName === "" (the SP inserts these for candidates who tapped
-// "Add Experience" but left the form blank).  Now both checks require that
-// at least one Experience entry has a non-empty companyName.
 
 function matchesFilters(candidate, filters) {
   // ── ROOT ──────────────────────────────────────────────────────────────────
@@ -788,8 +1067,19 @@ function matchesFilters(candidate, filters) {
 
   // ── PROFILE ───────────────────────────────────────────────────────────────
   if (filters.isStudying != null) {
-    if (Boolean(candidate.Profile?.isStudying) !== Boolean(filters.isStudying))
-      return false;
+    // Skip isStudying filter when a graduation year is also set.
+    // "completed study in 2019" → LLM sets isStudying: false, but many
+    // candidates have isStudying = null (not filled in). The graduation
+    // year filter is more accurate for this intent.
+    const hasGradYearFilter =
+      filters.ugGraduationYear != null || filters.pgGraduationYear != null;
+    if (!hasGradYearFilter) {
+      // Only apply isStudying when the profile field is explicitly set (not null).
+      // Candidates who never filled in isStudying should not be excluded.
+      const val = candidate.Profile?.isStudying;
+      if (val != null && Boolean(val) !== Boolean(filters.isStudying))
+        return false;
+    }
   }
   if (filters.gender) {
     const g = (candidate.Profile?.Gender || "").toLowerCase();
@@ -808,52 +1098,135 @@ function matchesFilters(candidate, filters) {
     if (hasIt !== Boolean(filters.hasPortfolio)) return false;
   }
 
+  // ── BIRTHDATE / AGE ───────────────────────────────────────────────────────
+  // dateOfBirth is stored as ISO string e.g. "2000-05-15T18:30:00Z"
+  // We extract the birth year and compare against the filter.
+  if (filters.birthYear != null || filters.birthYearFrom != null || filters.birthYearTo != null) {
+    const dob = candidate.Profile?.dateOfBirth;
+    // If no DOB recorded, exclude — we can't verify the birthdate range
+    if (!dob || dob === "" || dob === null) return false;
+    const birthYear = parseInt(String(dob).split("-")[0], 10);
+    if (isNaN(birthYear) || birthYear < 1900 || birthYear > 2100) return false;
+
+    if (filters.birthYear != null && birthYear !== Number(filters.birthYear)) return false;
+    if (filters.birthYearFrom != null && birthYear < Number(filters.birthYearFrom)) return false;
+    if (filters.birthYearTo != null && birthYear > Number(filters.birthYearTo)) return false;
+  }
+
   // ── EDUCATION ─────────────────────────────────────────────────────────────
   if (filters.ugDegree) {
     const edu = candidate.Education || [];
-    const match = edu.some((e) =>
-      (e.UnderGraduationDegree || "")
-        .toLowerCase()
-        .includes(filters.ugDegree.toLowerCase()),
-    );
+    const ugQuery = filters.ugDegree.toLowerCase().trim();
+
+    const UG_ALIASES = {
+      "btech":    ["bachelor of technology", "b.tech", "b.e."],
+      "be":       ["bachelor of engineering", "b.e."],
+      "bca":      ["bachelor of computer", "bca"],
+      "bsc":      ["bachelor of science", "b.sc"],
+      "ba":       ["bachelor of arts", "b.a."],
+      "bcom":     ["bachelor of commerce", "b.com"],
+      "bba":      ["bachelor of business", "bba", "bbm"],
+      "bbm":      ["bachelor of business", "bbm"],
+      "barch":    ["bachelor of architecture", "b.arch"],
+      "bachelors":["bachelor"],
+      "bachelor": ["bachelor"],
+      "degree":   ["bachelor", "master"],
+      "graduation":["bachelor"],
+      "undergrad":["bachelor"],
+    };
+
+    const keywords = UG_ALIASES[ugQuery] || [ugQuery];
+    const match = edu.some((e) => {
+      const deg = (e.UnderGraduationDegree || "").toLowerCase();
+      return keywords.some((kw) => deg.includes(kw));
+    });
     if (!match) return false;
   }
   if (filters.pgDegree) {
     const edu = candidate.Education || [];
-    const match = edu.some((e) =>
-      (e.PostGraduationDegree || "")
-        .toLowerCase()
-        .includes(filters.pgDegree.toLowerCase()),
-    );
+    const pgQuery = filters.pgDegree.toLowerCase().trim();
+
+    // Expand generic degree terms to keywords that actually appear in DB values.
+    // e.g. "Masters" → matches "Master of Technology", "Master of Arts", "M.Tech" etc.
+    const PG_ALIASES = {
+      "masters":  ["master"],
+      "master":   ["master"],
+      "master degree": ["master"],
+      "masters degree": ["master"],
+      "pg":       ["master", "m."],
+      "mtech":    ["master of technology", "m.tech", "m.e."],
+      "mba":      ["master of business", "mba"],
+      "mca":      ["master of computer", "mca"],
+      "msc":      ["master of science", "m.sc"],
+      "ma":       ["master of arts", "m.a."],
+      "mcom":     ["master of commerce", "m.com"],
+      "me":       ["master of engineering", "m.e."],
+      "march":    ["master of architecture", "m.arch"],
+    };
+
+    const keywords = PG_ALIASES[pgQuery] || [pgQuery];
+    const match = edu.some((e) => {
+      const deg = (e.PostGraduationDegree || "").toLowerCase();
+      return keywords.some((kw) => deg.includes(kw));
+    });
     if (!match) return false;
   }
   if (filters.hasPostGraduation != null) {
-    const edu = candidate.Education || [];
-    const hasPg = edu.some(
-      (e) => e.PostGraduationDegree && e.PostGraduationDegree.trim() !== "",
-    );
-    if (hasPg !== Boolean(filters.hasPostGraduation)) return false;
+    // Skip this check if pgDegree is already set — pgDegree implies hasPostGraduation.
+    // This prevents double-filtering where pgDegree passes but hasPostGraduation
+    // runs a stricter check and rejects the same candidate.
+    if (!filters.pgDegree) {
+      const edu = candidate.Education || [];
+      const hasPg = edu.some(
+        (e) => e.PostGraduationDegree && e.PostGraduationDegree.trim() !== "",
+      );
+      if (hasPg !== Boolean(filters.hasPostGraduation)) return false;
+    }
   }
   if (filters.ugGraduationYear != null) {
     const edu = candidate.Education || [];
-    const match = edu.some(
-      (e) =>
-        Number(e.underGraduationEndYear) === Number(filters.ugGraduationYear),
-    );
+    const target = Number(filters.ugGraduationYear);
+
+    const match = edu.some((e) => {
+      const ugRaw = e.underGraduationEndYear;
+      const pgRaw = e.postGraduationEndYear;
+
+      // Handle all possible storage formats:
+      // number: 2019, float: 2019.0, string: "2019", "2019-01-01", null, ""
+      const parseYear = (val) => {
+        if (val == null || val === "" || val === "null") return null;
+        // If it looks like a date string "2019-01-01", extract the year part
+        if (typeof val === "string" && val.includes("-")) {
+          const y = parseInt(val.split("-")[0], 10);
+          return isNaN(y) ? null : y;
+        }
+        const n = parseInt(String(val), 10);
+        return isNaN(n) ? null : n;
+      };
+
+      const ugYear = parseYear(ugRaw);
+      const pgYear = parseYear(pgRaw);
+
+      return ugYear === target ||
+        (filters.pgGraduationYear == null && pgYear === target);
+    });
     if (!match) return false;
   }
   if (filters.pgGraduationYear != null) {
     const edu = candidate.Education || [];
-    const match = edu.some(
-      (e) =>
-        Number(e.postGraduationEndYear) === Number(filters.pgGraduationYear),
-    );
+    const target = Number(filters.pgGraduationYear);
+    const match = edu.some((e) => {
+      const raw = e.postGraduationEndYear;
+      if (raw == null || raw === "" || raw === "null") return false;
+      if (typeof raw === "string" && raw.includes("-")) {
+        return parseInt(raw.split("-")[0], 10) === target;
+      }
+      return parseInt(String(raw), 10) === target;
+    });
     if (!match) return false;
   }
 
-  // ── EXPERIENCE  [FIX-2] ───────────────────────────────────────────────────
-  // Ignore placeholder rows where companyName is blank ("") — the SP creates
-  // these when a candidate opens the experience form but never fills it in.
+  // ── EXPERIENCE ────────────────────────────────────────────────────────────
   if (filters.isCurrentlyWorking != null) {
     const realExp = (candidate.Experience || []).filter(
       (e) => e.companyName && e.companyName.trim() !== "",
@@ -918,6 +1291,15 @@ function matchesFilters(candidate, filters) {
     );
     if (hasIt !== Boolean(filters.hasFeedback)) return false;
   }
+  if (filters.interviewer) {
+    const target = filters.interviewer.toLowerCase().trim();
+    const match = (candidate.Applications || []).some((app) =>
+      (app.Interviews || []).some((i) =>
+        (i.Interviewer || "").toLowerCase().includes(target),
+      ),
+    );
+    if (!match) return false;
+  }
   if (filters.interviewStatus) {
     const target = filters.interviewStatus.toLowerCase();
     const match = (candidate.Applications || []).some((app) =>
@@ -938,12 +1320,14 @@ function matchesFilters(candidate, filters) {
     );
     if (allMarks.length === 0) return false;
     const passes = allMarks.some((m) => {
-      if (op === "eq") return m === target;
-      if (op === "gt") return m > target;
-      if (op === "lt") return m < target;
-      if (op === "gte") return m >= target;
-      if (op === "lte") return m <= target;
-      return m === target;
+      // Use Math.round to handle float storage (e.g. 30.0 === 30)
+      const mRounded = Math.round(m * 100) / 100;
+      if (op === "eq") return Math.abs(mRounded - target) < 0.01;
+      if (op === "gt") return mRounded > target;
+      if (op === "lt") return mRounded < target;
+      if (op === "gte") return mRounded >= target;
+      if (op === "lte") return mRounded <= target;
+      return Math.abs(mRounded - target) < 0.01;
     });
     if (!passes) return false;
   }
@@ -983,8 +1367,6 @@ function matchesFilters(candidate, filters) {
     );
     if (hasIt !== Boolean(filters.hasResume)) return false;
   }
-  // resumeCount — filter by exact/min/max number of uploaded resumes
-  // e.g. "candidates who uploaded 2 resumes" → resumeCount:2, operator:"eq"
   if (filters.resumeCount != null) {
     const count = (candidate.Resumes || []).filter(
       (r) => r.resume && r.resume.trim() !== "",
@@ -1007,6 +1389,84 @@ function matchesFilters(candidate, filters) {
   }
 
   return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getSummarySections
+// ─────────────────────────────────────────────────────────────────────────────
+// Returns the minimal set of DB sections needed for a LIST query.
+// For a single-candidate detail query, ALL_SECTIONS is used instead.
+//
+// Rules:
+//   • Always include root + Profile (name, city, state are always useful).
+//   • Include Skills always (useful in every list).
+//   • Include Education only when an education filter was applied.
+//   • Include Experience only when an experience filter was applied.
+//   • Include Applications (+Interviews) when any application/interview
+//     filter was applied, OR when the LLM sectionsNeeded said to include it.
+//   • Never include Documents or Resumes for list views — not useful in a table.
+
+function getSummarySections(filters, llmSectionsNeeded) {
+  const sections = new Set(["root", "Profile", "Skills"]);
+
+  // Birthdate filters — always include Profile section
+  if (filters.birthYear != null || filters.birthYearFrom != null || filters.birthYearTo != null) {
+    sections.add("Profile");
+  }
+
+  // Education filters — always include Education section when any edu filter is set
+  if (
+    filters.ugDegree ||
+    filters.pgDegree ||
+    filters.hasPostGraduation != null ||
+    filters.ugGraduationYear != null ||
+    filters.pgGraduationYear != null
+  ) {
+    sections.add("Education");
+  }
+
+  // Also add Education when sectionsNeeded from LLM is missing it but
+  // we have education-related filters — prevents "0 results" from missing data
+  if ((filters.pgDegree || filters.ugDegree || filters.hasPostGraduation != null)
+      && Array.isArray(llmSectionsNeeded)
+      && !llmSectionsNeeded.includes("Education")) {
+    sections.add("Education");
+  }
+
+  // Experience filters
+  if (filters.hasExperience != null || filters.isCurrentlyWorking != null) {
+    sections.add("Experience");
+  }
+
+  // Application / interview filters
+  if (
+    filters.isShortlisted != null ||
+    filters.isAccepted != null ||
+    filters.hasApplied != null ||
+    filters.applicationStatus ||
+    filters.hasInterview != null ||
+    filters.interviewStatus ||
+    filters.interviewer ||
+    filters.isQualified != null ||
+    filters.hasFeedback != null ||
+    filters.marksObtained != null
+  ) {
+    sections.add("Applications");
+    sections.add("Applications.Interviews");
+  }
+
+  // Also respect specific section hints from the LLM (but never Documents/Resumes)
+  if (Array.isArray(llmSectionsNeeded)) {
+    const allowed = new Set(["root", "Profile", "Skills", "Education", "Experience", "Applications", "Applications.Interviews"]);
+    llmSectionsNeeded.forEach((s) => { if (allowed.has(s)) sections.add(s); });
+  }
+
+  // Always include Applications for shortlisted/accepted display
+  if (!sections.has("Applications")) {
+    sections.add("Applications");
+  }
+
+  return [...sections];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
