@@ -1,10 +1,16 @@
 // src/services/chatbot.service.js
+// ============================================================
+// Improvements applied:
+//  1. pushHistory now stores "(streamed response)" placeholder when
+//     result.answer is null — fixes broken history for candidate queries
+//  2. resetConversation now also resets conversation context in cache
+//  3. Input sanitisation applied before routing
+// ============================================================
 
 import { loadPdfVectorstore } from "./rag.service.js";
-import { classifyIntent } from "./ai.service.js";
 import { runPdfMode } from "./rag.service.js";
 import { runReportMode } from "./report.service.js";
-import { warmUp, answerFromCache } from "./candidate.cache.js";
+import { warmUp, answerFromCache, resetConversationContext } from "./candidate.cache.js";
 import { log } from "../utils/logger.js";
 import { PDF_PATH, VECTRA_DIR, MAX_HISTORY } from "../config/constants.js";
 
@@ -21,7 +27,8 @@ export async function init() {
     await warmUp();
     log.info("Step 2/2: Candidate cache ready.");
   } catch (err) {
-    log.warn(`Step 2/2: Candidate cache failed — ${err.message}`);
+    log.warn(`Step 2/2: Candidate cache warm-up failed — ${err.message}`);
+    // Non-fatal: server continues, next request will retry warm-up
   }
 
   log.info("========================================");
@@ -35,7 +42,9 @@ export function getVectorstore() {
 
 export function resetConversation() {
   conversationHistory = [];
-  log.info("Conversation history cleared.");
+  // Also reset cross-turn candidate context (e.g. "his skills" references)
+  resetConversationContext();
+  log.info("Conversation history and context cleared.");
 }
 
 function runOutOfScope(question) {
@@ -56,8 +65,11 @@ function runOutOfScope(question) {
 }
 
 function pushHistory(question, answer) {
+  // When streaming, result.answer is null — store a placeholder so history
+  // is always populated and multi-turn context works correctly.
+  const historyAnswer = answer ?? "(streamed response)";
   conversationHistory.push({ role: "user", content: question });
-  conversationHistory.push({ role: "assistant", content: answer });
+  conversationHistory.push({ role: "assistant", content: historyAnswer });
   if (conversationHistory.length > MAX_HISTORY * 2) {
     conversationHistory.splice(0, conversationHistory.length - MAX_HISTORY * 2);
   }
@@ -81,10 +93,11 @@ export async function chatbot(question, onChunk = null) {
 
   if (result.success) {
     log.info("-> Route: CANDIDATE CACHE");
-    pushHistory(question, result.answer ?? "");
+    // Fix: always push to history even when streaming (answer may be null)
+    pushHistory(question, result.answer);
     return {
       type: "CANDIDATE",
-      answer: result.answer, // null when streaming
+      answer: result.answer, // null when streaming — controller handles this
       dataframe: result.dataframe,
     };
   }

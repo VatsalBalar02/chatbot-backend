@@ -1,8 +1,20 @@
 // src/controllers/chat.controller.js
+// ============================================================
+// Improvements applied:
+//  1. Request timeout (30 s) — hung LLM/DB calls no longer keep
+//     SSE connections open forever
+//  2. try/catch/finally — res.end() is always called exactly once
+//  3. sendEvent in catch is wrapped in its own try/catch — safe
+//     to call even after headers are flushed
+//  4. Timeout is cleared on both success AND error paths
+//  5. writableEnded guard prevents "write after end" crash
+// ============================================================
 
 import { chatbot, resetConversation } from "../services/chatbot.service.js";
 import { forceRefresh, getCacheStatus } from "../services/candidate.cache.js";
 import { log } from "../utils/logger.js";
+
+const STREAM_TIMEOUT_MS = 30_000; // 30 seconds
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/chat
@@ -34,19 +46,43 @@ export async function handleChat(req, res) {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
+    // Safe event sender — guards against writing after the stream has ended
     const sendEvent = (payload) => {
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      if (res.flush) res.flush();
+      if (res.writableEnded) return;
+      try {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        if (res.flush) res.flush();
+      } catch (writeErr) {
+        log.warn(`sendEvent write error (client likely disconnected): ${writeErr.message}`);
+      }
     };
 
-    // onChunk receives a plain STRING from ai.service.js / candidate.cache.js
-    // and wraps it into the SSE { type:"token", text } shape for the frontend.
+    // onChunk receives a plain STRING and wraps it into SSE { type:"token", text }
     const onChunk = (text) => {
       if (text) sendEvent({ type: "token", text });
     };
 
+    // ── Request timeout ──────────────────────────────────────────────────────
+    // Prevents a hung DB call or LLM call from keeping the connection open forever.
+    let timeoutFired = false;
+    const timeoutHandle = setTimeout(() => {
+      timeoutFired = true;
+      log.warn(`Stream timeout after ${STREAM_TIMEOUT_MS}ms for question: "${question.slice(0, 80)}"`);
+      sendEvent({ type: "error", message: "Request timed out. Please try again." });
+      if (!res.writableEnded) {
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+    }, STREAM_TIMEOUT_MS);
+
     try {
       const result = await chatbot(question.trim(), onChunk);
+
+      // Clear timeout — we got a response in time
+      clearTimeout(timeoutHandle);
+
+      // If the timeout already fired, don't try to write again
+      if (timeoutFired) return;
 
       // PDF / REPORT / OOS: answer was NOT streamed via onChunk — send it now
       if (result.answer) {
@@ -58,14 +94,23 @@ export async function handleChat(req, res) {
         routeType: result.type,
         dataframe: result.dataframe ?? null,
       });
-
-      res.write("data: [DONE]\n\n");
-      res.end();
     } catch (err) {
+      clearTimeout(timeoutHandle);
       log.error(`Stream error: ${err.message}`);
-      sendEvent({ type: "error", message: "An error occurred. Please try again." });
-      res.write("data: [DONE]\n\n");
-      res.end();
+      if (!timeoutFired) {
+        // Attempt to notify the client — safe even if headers are already sent
+        try {
+          sendEvent({ type: "error", message: "An error occurred. Please try again." });
+        } catch (_) {
+          // Swallow — client disconnected before we could notify
+        }
+      }
+    } finally {
+      // Always close the stream exactly once
+      if (!res.writableEnded) {
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
     }
 
     return;
@@ -117,6 +162,7 @@ export async function refreshCache(req, res) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/cache/status
+// Now also returns lastRefreshError so ops can see if background refresh failed
 // ─────────────────────────────────────────────────────────────────────────────
 export async function cacheStatus(req, res) {
   try {

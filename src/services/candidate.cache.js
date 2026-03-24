@@ -1,4 +1,3 @@
-// ============================================================
 // candidate.cache.js
 
 import { getPool } from "../db/connection.js";
@@ -9,6 +8,10 @@ const SP_NAME = "dbo.sp_GetAllCandidateDetails_Full";
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const MAX_CANDIDATES_TO_LLM = 50;
 const NAME_LIST_CHAR_CAP = 3000;
+
+
+const ANALYSIS_CACHE_TTL = 5 * 60 * 1000; 
+const ANALYSIS_CACHE_MAX = 200;
 
 const ALL_SECTIONS = [
   "root",
@@ -22,46 +25,71 @@ const ALL_SECTIONS = [
   "Resumes",
 ];
 
-let candidateStore = null;
+// ─────────────────────────────────────────────────────────────────────────────
+// MODULE STATE
+// ─────────────────────────────────────────────────────────────────────────────
+
+let candidateStore = null;         
 let refreshTimer = null;
+let warmUpPromise = null;          
+let lastRefreshError = null;       
+let candidateIndex = null;
+
+const analysisCache = new Map();
+
+
+let lastResolvedContext = {};      
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PUBLIC API
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function warmUp() {
+ 
+  if (warmUpPromise) return warmUpPromise;
+  warmUpPromise = _doWarmUp().finally(() => { warmUpPromise = null; });
+  return warmUpPromise;
+}
+
+async function _doWarmUp() {
   log.info("Candidate cache warm-up starting...");
-  try {
-    await loadFromSp();
-    scheduleAutoRefresh();
-    log.info(
-      `Candidate cache ready — ${candidateStore.candidates.length} candidates, cachedAt: ${candidateStore.cachedAt}`,
-    );
-  } catch (err) {
-    log.error(`Candidate cache warm-up failed: ${err.message}`);
-    throw err;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await loadFromSp();
+      scheduleAutoRefresh();
+      lastRefreshError = null;
+      log.info(
+        `Candidate cache ready — ${candidateStore.candidates.length} candidates, cachedAt: ${candidateStore.cachedAt}`,
+      );
+      return;
+    } catch (err) {
+      log.error(`Warm-up attempt ${attempt}/${MAX_ATTEMPTS} failed: ${err.message}`);
+      lastRefreshError = err.message;
+      if (attempt < MAX_ATTEMPTS) {
+        const delay = attempt * 2000;
+        log.info(`Retrying warm-up in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// answerFromCache
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// onChunk — optional async (text: string) => void streaming callback.
-//           When provided the answer is streamed token-by-token directly to
-//           the caller (e.g. the HTTP response).  The `answer` field in the
-//           returned object will be null in this mode — the caller should NOT
-//           try to send it again.
-//           When omitted the full answer string is returned in result.answer
-//           (backward-compatible non-streaming behaviour).
-//
+
 export async function answerFromCache(question, options = {}) {
-  // Support both calling conventions:
-  //   answerFromCache(q, { onChunk })  ← chatbot.service.js
-  //   answerFromCache(q, fn)           ← legacy direct callback
+ 
+  
   const onChunk = typeof options === "function"
     ? options
     : (options?.onChunk ?? null);
+
+  
+  question = String(question).trim().slice(0, 500);
+ 
+  question = question.replace(/[`\\]/g, " ");
+
   if (!candidateStore) {
     log.warn("Cache cold — triggering warm-up");
     await warmUp();
@@ -70,22 +98,33 @@ export async function answerFromCache(question, options = {}) {
   const ageMs = Date.now() - candidateStore.cachedAt.getTime();
   if (ageMs > CACHE_TTL_MS) {
     log.info("Cache stale — background refresh triggered");
-    loadFromSp().catch((e) =>
-      log.error(`Background refresh failed: ${e.message}`),
-    );
+    loadFromSp().catch((e) => {
+      lastRefreshError = e.message;
+      log.error(`Background refresh failed: ${e.message}`);
+    });
   }
 
-  // Step 1: single LLM call — routing + entities + filters + sections
+  
   const analysis = await analyzeQuestion(question, candidateStore.candidates);
 
-  // Post-analysis fix: override OOS intent for known patterns the LLM
-  // misclassifies. These are all clearly candidate data queries.
+  
+
+  if (!analysis.entities.candidateName && lastResolvedContext.candidateName) {
+    const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
+    if (pronounPattern.test(question)) {
+      analysis.entities.candidateName = lastResolvedContext.candidateName;
+      log.info(`[ContextInherit] Carried forward candidateName: "${lastResolvedContext.candidateName}"`);
+    }
+  }
+
+  
   fixMisclassifiedIntent(analysis, question);
 
   log.info(`[Step 1] Analysis: ${JSON.stringify(analysis)}`);
 
-  // Non-candidate → signal router
+  
   if (["PDF", "REPORT", "OOS"].includes(analysis.intent)) {
+    
     return {
       success: false,
       forwardIntent: analysis.intent,
@@ -106,7 +145,6 @@ export async function answerFromCache(question, options = {}) {
       `- **Cancelled** — *"candidates with cancelled interviews"*`;
 
     if (onChunk) await onChunk(msg);
-
     return {
       success: true,
       type: "CACHE",
@@ -170,9 +208,6 @@ export async function answerFromCache(question, options = {}) {
 
   // ── CANDIDATE intent ─────────────────────────────────────────────────────
 
-  // Detect "highest marks" / "lowest marks" / "top scorer" intent.
-  // The LLM returns marksObtained: null for these because "highest" is not a
-  // numeric value — we handle it here with a sort instead of a filter.
   const q = question.toLowerCase();
   const isHighestMarks =
     (q.includes("highest") || q.includes("top scorer") || q.includes("most marks") || q.includes("best marks")) &&
@@ -181,7 +216,7 @@ export async function answerFromCache(question, options = {}) {
     (q.includes("lowest") || q.includes("least marks") || q.includes("minimum marks")) &&
     (q.includes("mark") || q.includes("score") || q.includes("marks"));
 
-  // Step 2: filter — returns full matched pool (no slice)
+  
   const filtered = filterCandidates(analysis.entities, analysis.filters || {});
   log.info(`[Step 2] Candidates after filter: ${filtered.length} | isHighestMarks: ${isHighestMarks} | isLowestMarks: ${isLowestMarks}`);
 
@@ -200,18 +235,14 @@ export async function answerFromCache(question, options = {}) {
     };
   }
 
-  // ── Highest / Lowest marks: sort the full pool by best marks, take top N ──
-  // This runs before slicing so we always show the genuinely top-scoring
-  // candidates, not just whoever happened to be first in the DB.
+  
   let sortedFiltered = filtered;
   if (isHighestMarks || isLowestMarks) {
-    // Compute each candidate's best (max) marks across all interviews
     const getBestMarks = (candidate) => {
       const allMarks = (candidate.Applications || []).flatMap((app) =>
-        (app.Interviews || [])
-          .map((i) => i.marksObtained)
-          .filter((m) => m != null)
-          .map(Number),
+        (Array.isArray(app.Interviews) ? app.Interviews : [])
+          .map((i) => parseFloat(i.marksObtained))
+          .filter((m) => !isNaN(m)),
       );
       return allMarks.length > 0 ? Math.max(...allMarks) : -1;
     };
@@ -222,26 +253,16 @@ export async function answerFromCache(question, options = {}) {
       return isHighestMarks ? marksB - marksA : marksA - marksB;
     });
 
-    // Remove candidates with no marks at all for highest/lowest queries
     sortedFiltered = sortedFiltered.filter((c) => getBestMarks(c) >= 0);
-
-    log.info(`[Marks sort] ${isHighestMarks ? "Highest" : "Lowest"} marks sort applied — ${sortedFiltered.length} candidates with marks`);
+    log.info(`[Marks sort] ${isHighestMarks ? "Highest" : "Lowest"} marks sort — ${sortedFiltered.length} candidates with marks`);
   }
 
   // Step 3: project
-  // isSingleCandidate = true when the user asked about a specific person by
-  // name. Controls column set (summary vs full) and interview detail level.
   const isSingleCandidate = !!(
     analysis.entities?.candidateName &&
     analysis.entities.candidateName.trim() !== ""
   );
 
-  // Sections to project:
-  // • Single candidate + LLM gave specific sections (e.g. ["root","Skills"])
-  //   → use exactly those sections — "tell me skills of X" only needs Skills
-  // • Single candidate + LLM said "ALL" or gave nothing
-  //   → use ALL_SECTIONS (full profile view)
-  // • List query → use getSummarySections() (minimal relevant sections)
   const llmSections = analysis.sectionsNeeded;
   const sections = isSingleCandidate
     ? (llmSections === "ALL" || !Array.isArray(llmSections)
@@ -266,8 +287,15 @@ export async function answerFromCache(question, options = {}) {
     `[Step 3] isSingleCandidate: ${isSingleCandidate} | Sections: ${JSON.stringify(sections)} — userLimit: ${userLimit ?? "none"} — sending ${projected.length} of ${filtered.length} candidates to LLM`,
   );
 
+  if (analysis.entities?.candidateName) {
+    lastResolvedContext = {
+      candidateName: analysis.entities.candidateName,
+      jobTitle: analysis.entities.jobTitle ?? lastResolvedContext.jobTitle,
+    };
+  }
+
   // Step 4: answer
-  // Pass isSingleCandidate so generateNaturalAnswer picks the right column set.
+  const responseType = detectResponseType(question);
   const answer = await generateNaturalAnswer(
     question,
     `${SP_NAME} (cached at ${candidateStore.cachedAt.toLocaleString()})`,
@@ -276,7 +304,8 @@ export async function answerFromCache(question, options = {}) {
       userLimit,
       totalFound: (isHighestMarks || isLowestMarks) ? sortedFiltered.length : filtered.length,
       isSingleCandidate,
-      sectionsNeeded: sections, // tells ai.service.js which fields to show
+      sectionsNeeded: sections,
+      responseType:responseType,
     },
     onChunk,
   );
@@ -299,11 +328,18 @@ export async function answerFromCache(question, options = {}) {
 export async function forceRefresh() {
   log.info("Manual cache refresh triggered");
   await loadFromSp();
+  lastRefreshError = null;
   return getCacheStatus();
 }
 
 export function getCacheStatus() {
-  if (!candidateStore) return { status: "cold", message: "Cache not loaded" };
+  if (!candidateStore) {
+    return {
+      status: "cold",
+      message: "Cache not loaded",
+      lastRefreshError,
+    };
+  }
   const ageMs = Date.now() - candidateStore.cachedAt.getTime();
   return {
     status: ageMs > CACHE_TTL_MS ? "stale" : "warm",
@@ -311,16 +347,24 @@ export function getCacheStatus() {
     ageMinutes: Math.floor(ageMs / 60000),
     totalCandidates: candidateStore.candidates.length,
     ttlMinutes: CACHE_TTL_MS / 60000,
+    lastRefreshError,
   };
 }
 
 export function clearCache() {
   candidateStore = null;
+  lastResolvedContext = {};
+  analysisCache.clear();
   if (refreshTimer) {
     clearInterval(refreshTimer);
     refreshTimer = null;
   }
   log.info("Candidate cache cleared");
+}
+
+export function resetConversationContext() {
+  lastResolvedContext = {};
+  log.info("Conversation context reset");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,9 +375,24 @@ async function loadFromSp() {
   const pool = await getPool();
   const result = await pool.request().execute(SP_NAME);
   const rows = result.recordset || [];
-  if (rows.length === 0) log.warn("SP returned 0 rows");
-  candidateStore = { cachedAt: new Date(), candidates: rows.map(parseRow) };
-  log.info(`SP load complete — ${candidateStore.candidates.length} candidates`);
+
+  if (!rows || rows.length === 0) {
+    log.warn("SP returned 0 rows");
+  }
+
+  // ✅ FIX: always define parsed properly
+  const parsedCandidates = rows.map(parseRow);
+
+  // ✅ assign store
+  candidateStore = {
+    cachedAt: new Date(),
+    candidates: parsedCandidates,
+  };
+
+  // ✅ build index
+  candidateIndex = buildIndex(parsedCandidates);
+
+  log.info(`SP load complete — ${parsedCandidates.length} candidates`);
 }
 
 function parseRow(row) {
@@ -355,6 +414,58 @@ function parseRow(row) {
   };
 }
 
+function buildIndex(candidates) {
+  const index = {
+    byName: new Map(),
+    byCity: new Map(),
+    byState: new Map(),
+    bySkill: new Map(),
+    byJobTitle: new Map(),
+  };
+
+  for (const c of candidates) {
+    // NAME
+    const name = (c.FullName || "").toLowerCase().trim();
+    if (name) {
+      index.byName.set(name, c);
+    }
+
+    // CITY
+    const city = (c.Profile?.city || "").toLowerCase().trim();
+    if (city) {
+      if (!index.byCity.has(city)) index.byCity.set(city, []);
+      index.byCity.get(city).push(c);
+    }
+
+    // STATE
+    const state = (c.Profile?.state || "").toLowerCase().trim();
+    if (state) {
+      if (!index.byState.has(state)) index.byState.set(state, []);
+      index.byState.get(state).push(c);
+    }
+
+    // SKILLS
+    for (const s of c.Skills || []) {
+      const skill = (s.Skill || "").toLowerCase().trim();
+      if (!skill) continue;
+
+      if (!index.bySkill.has(skill)) index.bySkill.set(skill, []);
+      index.bySkill.get(skill).push(c);
+    }
+
+    // JOB TITLE
+    for (const app of c.Applications || []) {
+      const job = (app.JobTitle || "").toLowerCase().trim();
+      if (!job) continue;
+
+      if (!index.byJobTitle.has(job)) index.byJobTitle.set(job, []);
+      index.byJobTitle.get(job).push(c);
+    }
+  }
+
+  return index;
+}
+
 function safeParseJson(value, fallback) {
   if (!value) return fallback;
   if (typeof value === "object") return value;
@@ -371,29 +482,20 @@ function scheduleAutoRefresh() {
     log.info("Auto-refresh — reloading candidate data...");
     try {
       await loadFromSp();
+      lastRefreshError = null;
       log.info("Auto-refresh complete");
     } catch (err) {
+      lastRefreshError = err.message;
       log.error(`Auto-refresh failed: ${err.message}`);
     }
   }, CACHE_TTL_MS);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-// fixMisclassifiedIntent
-// ─────────────────────────────────────────────────────────────────────────────
-// Fixes cases where analyzeQuestion returns OOS/PDF for queries that are
-// clearly about candidate data. Mutates the analysis object in place.
-//
-// These patterns are reliably misclassified by gpt-4o-mini:
-//   • birthdate / age range queries → CANDIDATE + birthYear filters
-//   • graduation year queries        → CANDIDATE + ugGraduationYear filter
-//   • interviewer queries            → CANDIDATE + interviewer filter
-//
+
 function fixMisclassifiedIntent(analysis, question) {
   const q = question.toLowerCase();
 
-  // ── Birthdate / age range ─────────────────────────────────────────────────
+ 
   const birthdatePatterns = [
     /birth\s*date/i, /date\s*of\s*birth/i, /dob/i,
     /born\s*(in|between|after|before|from)/i,
@@ -401,10 +503,8 @@ function fixMisclassifiedIntent(analysis, question) {
     /born\s*\d{4}/i,
   ];
   const hasBirthdatePattern = birthdatePatterns.some((r) => r.test(question));
-
-  // Also detect "between YEAR to/and YEAR" or "from YEAR to YEAR"
   const yearRangeMatch = question.match(
-    /(?:between|from)\s+(\d{4})\s+(?:to|and|-)\s+(\d{4})/i
+    /(?:between|from)\s+(\d{4})\s+(?:to|and|-)\s+(\d{4})/i,
   );
 
   if (hasBirthdatePattern || (yearRangeMatch && q.includes("birth"))) {
@@ -412,25 +512,18 @@ function fixMisclassifiedIntent(analysis, question) {
       analysis.intent = "CANDIDATE";
       log.info(`[IntentFix] Birthdate query overridden → CANDIDATE`);
     }
-    // Always set Profile section for birthdate queries
     if (!Array.isArray(analysis.sectionsNeeded) || !analysis.sectionsNeeded.includes("Profile")) {
       analysis.sectionsNeeded = ["root", "Profile"];
     }
-
-    // ALWAYS overwrite birthYear filters from question text — never trust
-    // the LLM values which can be swapped or wrong for range queries.
     if (yearRangeMatch) {
       const y1 = parseInt(yearRangeMatch[1], 10);
       const y2 = parseInt(yearRangeMatch[2], 10);
-      // Always assign smaller year to From, larger to To regardless of order
       analysis.filters.birthYearFrom = Math.min(y1, y2);
       analysis.filters.birthYearTo   = Math.max(y1, y2);
-      // Clear conflicting single year
       analysis.filters.birthYear = null;
       log.info(`[IntentFix] birthYearFrom: ${analysis.filters.birthYearFrom}, birthYearTo: ${analysis.filters.birthYearTo}`);
     } else {
-      // Single year — extract from question, e.g. "born in 2001", "birthdate 2001"
-      const allYears = [...question.matchAll(/(19|20)\d{2}/g)].map((m) => parseInt(m[0], 10));
+      const allYears = [...question.matchAll(/(19|20)\d{2}/g)].map((m) => parseInt(m[0], 10));
       if (allYears.length === 1 && !analysis.filters.birthYear) {
         analysis.filters.birthYear = allYears[0];
         analysis.filters.birthYearFrom = null;
@@ -440,7 +533,7 @@ function fixMisclassifiedIntent(analysis, question) {
     }
   }
 
-  // ── Graduation year — "completed study in YEAR" / "graduated in YEAR" ─────
+  // ── Graduation year ───────────────────────────────────────────────────────
   const gradPatterns = [
     /complet\w*\s+(?:their\s+)?study/i,
     /graduat\w*\s+in\s+\d{4}/i,
@@ -453,19 +546,15 @@ function fixMisclassifiedIntent(analysis, question) {
       analysis.sectionsNeeded = ["root", "Profile", "Education"];
       log.info(`[IntentFix] Graduation year query overridden → CANDIDATE`);
     }
-    // Extract year if not already set
-    const yearMatch = question.match(/(19|20)\d{2}/);
+    const yearMatch = question.match(/(19|20)\d{2}/);
     if (yearMatch && !analysis.filters.ugGraduationYear) {
       analysis.filters.ugGraduationYear = parseInt(yearMatch[0], 10);
-      analysis.filters.isStudying = null; // never set isStudying for grad year queries
+      analysis.filters.isStudying = null;
       log.info(`[IntentFix] ugGraduationYear: ${analysis.filters.ugGraduationYear}`);
     }
   }
 
-  // ── PDF / policy questions misclassified as OOS ──────────────────────────
-  // Detect HR policy/process questions that should go to PDF route
-  // HR/policy question keywords — any question containing these about HR topics
-  // should be PDF, never OOS
+  // ── PDF / policy keywords misclassified as OOS ────────────────────────────
   const pdfKeywords = [
     "recruitment process", "recruitment management", "recruitment policy",
     "hiring process", "hiring policy", "hiring procedure",
@@ -481,15 +570,66 @@ function fixMisclassifiedIntent(analysis, question) {
   ];
   const qLower = question.toLowerCase();
   const isPdfQuestion = pdfKeywords.some((kw) => qLower.includes(kw));
-
   if (analysis.intent === "OOS" && isPdfQuestion) {
     analysis.intent = "PDF";
     log.info(`[IntentFix] PDF policy question overridden from OOS → PDF`);
   }
 
-  // ── Interviewer — "interview taken by X" / "interviewed by X" ─────────────
+  const jobTitlePattern = question.match(
+    /(?:^|\bin\b|\bfor\b|\bapplied\s+(?:in|for)\b)\s+([A-Za-z0-9 ]+?)\s+\bjob\b/i,
+  );
+  if (jobTitlePattern) {
+    const extractedJobTitle = jobTitlePattern[1].trim();
+
+    const skipWords = new Set(["a", "the", "this", "that", "any", "some"]);
+    if (extractedJobTitle.length > 0 && !skipWords.has(extractedJobTitle.toLowerCase())) {
+      const cityVal  = (analysis.entities.city  || "").toLowerCase();
+      const stateVal = (analysis.entities.state || "").toLowerCase();
+      const extracted = extractedJobTitle.toLowerCase();
+
+      if (cityVal === extracted || stateVal === extracted) {
+        log.info(`[IntentFix] "in/for X job" — moving "${extractedJobTitle}" from city/state → jobTitle`);
+        if (cityVal === extracted)  analysis.entities.city  = null;
+        if (stateVal === extracted) analysis.entities.state = null;
+      }
+
+     
+      if (!analysis.entities.jobTitle ||
+          analysis.entities.jobTitle.toLowerCase() === "job" ||
+          analysis.entities.jobTitle.toLowerCase() === extracted) {
+        analysis.entities.jobTitle = extractedJobTitle;
+        log.info(`[IntentFix] jobTitle set to "${extractedJobTitle}" from "in/for X job" pattern`);
+      }
+      if (Array.isArray(analysis.sectionsNeeded)) {
+        if (!analysis.sectionsNeeded.includes("Applications")) {
+          analysis.sectionsNeeded.push("Applications");
+        }
+      }
+    }
+  }
+
+  
+  const jobPrefixPattern = question.match(
+    /^([A-Za-z0-9 ]+?)\s+\bjob\b(?:\s+(?:candidates?|wale|applicants?|people))?/i,
+  );
+  if (jobPrefixPattern && !jobTitlePattern) {
+    const extracted = jobPrefixPattern[1].trim();
+    const skipStarters = new Set(["candidate", "candidates", "show", "list", "find", "get", "all", "the", "a"]);
+    if (extracted.length > 0 && !skipStarters.has(extracted.toLowerCase())) {
+      const cityVal = (analysis.entities.city || "").toLowerCase();
+      if (cityVal === extracted.toLowerCase()) {
+        analysis.entities.city = null;
+        log.info(`[IntentFix] "X job" prefix — clearing wrong city "${extracted}"`);
+      }
+      if (!analysis.entities.jobTitle || analysis.entities.jobTitle.toLowerCase() === "job") {
+        analysis.entities.jobTitle = extracted;
+        log.info(`[IntentFix] "X job" prefix — jobTitle set to "${extracted}"`);
+      }
+    }
+  }
+  // ── Interviewer ───────────────────────────────────────────────────────────
   const interviewerMatch = question.match(
-    /(?:interview\w*\s+(?:taken\s+)?by|interviewed\s+by|interviewer\s+(?:is\s+)?)\s+(.+?)(?:\s*$|\s*\?)/i
+    /(?:interview\w*\s+(?:taken\s+)?by|interviewed\s+by|interviewer\s+(?:is\s+)?)\s+(.+?)(?:\s*$|\s*\?)/i,
   );
   if (interviewerMatch) {
     if (analysis.intent === "OOS" || analysis.intent === "PDF") {
@@ -505,19 +645,32 @@ function fixMisclassifiedIntent(analysis, question) {
   }
 }
 
-// analyzeQuestion — THE SINGLE LLM CALL
+// ─────────────────────────────────────────────────────────────────────────────
+// analyzeQuestion — THE SINGLE LLM CALL (with LRU cache + retry)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function analyzeQuestion(question, candidates) {
+ 
+  const cacheKey = question.toLowerCase().trim();
+  const cached = analysisCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < ANALYSIS_CACHE_TTL) {
+    log.info(`[AnalysisCache] HIT for: "${cacheKey.slice(0, 60)}"`);
+    return cached.result;
+  }
+
   const client = getOpenAIClient();
 
-  const nameList = candidates
-    .map((c) => c.FullName)
-    .filter(Boolean)
-    .reduce((acc, name) => {
-      const next = acc ? `${acc}, ${name}` : name;
-      return next.length > NAME_LIST_CHAR_CAP ? acc : next;
-    }, "");
+ 
+  const likelyNameQuery = /\b[A-Z][a-z]+\b/.test(question) || /\b(who is|about|tell me about|details of)\b/i.test(question);
+  const nameList = likelyNameQuery
+    ? candidates
+        .map((c) => c.FullName)
+        .filter(Boolean)
+        .reduce((acc, name) => {
+          const next = acc ? `${acc}, ${name}` : name;
+          return next.length > NAME_LIST_CHAR_CAP ? acc : next;
+        }, "")
+    : "(omitted — not a name-based query)";
 
   const prompt = `
 You are the routing and analysis brain of a recruitment chatbot.
@@ -681,6 +834,27 @@ ENTITY RULES:
     "students of MIT college"         → universityName: "MIT"
     "who studied at Nirma university" → universityName: "Nirma"
 
+CRITICAL — jobTitle vs city disambiguation:
+The word "in" before a job name does NOT mean location. These patterns ALL mean jobTitle:
+  "candidate in X job"       → jobTitle: "X",     city: null
+  "candidates in X job"      → jobTitle: "X",     city: null
+  "candidate for X job"      → jobTitle: "X",     city: null
+  "applied in X job"         → jobTitle: "X",     city: null
+  "applied for X job"        → jobTitle: "X",     city: null
+  "X job candidates"         → jobTitle: "X",     city: null
+  "candidate in GHU job"     → jobTitle: "GHU",   city: null  ← NOT city:"GHU"
+  "candidate in New Issue job" → jobTitle: "New Issue", city: null
+  "male candidate in GHU job"  → jobTitle: "GHU", city: null, gender: "Male"
+
+RULE: If the question contains "in X job" or "for X job" or "X job" where X is
+a word/phrase before the word "job", extract X as jobTitle — NEVER as city or state.
+Only extract city/state when the question says "from X", "in X city", "located in X",
+or X is a well-known city/state name used WITHOUT the word "job" after it.
+Examples of CORRECT city extraction:
+  "candidates from Surat"       → city: "Surat"
+  "candidates in Ahmedabad"     → city: "Ahmedabad"   (no "job" after it)
+  "male candidates from Gujarat" → state: "Gujarat"
+
 ────────────────────────────────────────
 FILTER RULES — populate "filters" based on what the user asks:
 
@@ -780,6 +954,20 @@ RESUMES:
   "less than 2 resumes"              → resumeCount: 2,  resumeCountOperator: "lt"
   "exactly 1 resume"                 → resumeCount: 1,  resumeCountOperator: "eq"
 
+  "experienceYears":         number or null,
+"experienceYearsOperator": "eq"|"gt"|"lt"|"gte"|"lte" or null,
+EXPERIENCE YEARS:
+  "2 years of experience"         → experienceYears: 2, experienceYearsOperator: "eq"
+  "more than 3 years experience"  → experienceYears: 3, experienceYearsOperator: "gt"
+  "at least 2 years experience"   → experienceYears: 2, experienceYearsOperator: "gte"
+  "less than 1 year experience"   → experienceYears: 1, experienceYearsOperator: "lt"
+  "under 5 years experience"      → experienceYears: 5, experienceYearsOperator: "lt"
+  "between 2 and 4 years"         → use experienceYearsFrom + experienceYearsTo
+  "freshers / no experience"      → hasExperience: false  (NOT experienceYears)
+  "has experience"                → hasExperience: true   (no year filter)
+  "experienceYearsFrom": number or null,
+"experienceYearsTo":   number or null,
+
   IMPORTANT: When the user mentions a specific NUMBER with "resume" (e.g.
   "upload 2 resume", "2 resumes", "uploaded 3 resumes"), ALWAYS set
   resumeCount to that number and resumeCountOperator to "eq".
@@ -805,109 +993,131 @@ When unsure → "ALL"
 User question: "${question.replace(/"/g, '\\"')}"
 JSON:`.trim();
 
-  try {
-    const resp = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 500,
-      temperature: 0,
-    });
-    let raw = (resp.choices[0].message.content || "")
-      .trim()
-      .replace(/^```[a-z]*\n?/, "")
-      .replace(/\n?```$/, "");
-    const parsed = JSON.parse(raw);
+  // ── LLM call with single retry on JSON parse failure ──────────────────────
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const resp = await client.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 500,
+        temperature: 0,
+      });
+      let raw = (resp.choices[0].message.content || "")
+        .trim()
+        .replace(/^```[a-z]*\n?/, "")
+        .replace(/\n?```$/, "");
 
-    const rawLimit = parsed.limit;
-    const safeLimit =
-      rawLimit != null &&
-      Number.isFinite(Number(rawLimit)) &&
-      Number(rawLimit) > 0
-        ? Math.floor(Number(rawLimit))
-        : null;
+      const parsed = JSON.parse(raw);
 
-    const rawEntities = parsed.entities || {};
-    const rawFilters  = parsed.filters  || {};
-
-    // ── Normalise misplaced fields ──────────────────────────────────────────
-    // The LLM sometimes puts filter-type values (gender, city, state, skill,
-    // language) inside "entities" instead of "filters".  Move them to the
-    // correct bucket so filterCandidates() picks them up.
-    const normEntities = { ...rawEntities };
-    const normFilters  = { ...rawFilters, interviewRound: rawFilters.interviewRound || null };
-
-    // gender → filters.gender
-    if (normEntities.gender != null && normEntities.gender !== "") {
-      normFilters.gender = normFilters.gender || normEntities.gender;
-      delete normEntities.gender;
-    }
-    // language → filters.languageKnown
-    if (normEntities.language != null && normEntities.language !== "") {
-      normFilters.languageKnown = normFilters.languageKnown || normEntities.language;
-      delete normEntities.language;
-    }
-    if (normEntities.languageKnown != null && normEntities.languageKnown !== "") {
-      normFilters.languageKnown = normFilters.languageKnown || normEntities.languageKnown;
-      delete normEntities.languageKnown;
-    }
-    // isStudying / isVerified / isProfileComplete → filters
-    ["isStudying","isVerified","isProfileComplete","hasExperience","isCurrentlyWorking",
-     "isShortlisted","isAccepted","hasInterview","hasResume"].forEach((key) => {
-      if (normEntities[key] != null) {
-        normFilters[key] = normFilters[key] ?? normEntities[key];
-        delete normEntities[key];
+      // ── Schema validation ─────────────────────────────────────────────────
+      if (!validateAnalysis(parsed)) {
+        throw new Error(`Invalid analysis schema: ${JSON.stringify(parsed).slice(0, 100)}`);
       }
-    });
 
-    // interviewer → filters.interviewer
-    if (normEntities.interviewer != null && normEntities.interviewer !== "") {
-      normFilters.interviewer = normFilters.interviewer || normEntities.interviewer;
-      delete normEntities.interviewer;
-    }
+      const rawLimit = parsed.limit;
+      const safeLimit =
+        rawLimit != null &&
+        Number.isFinite(Number(rawLimit)) &&
+        Number(rawLimit) > 0
+          ? Math.floor(Number(rawLimit))
+          : null;
 
-    // Also move any remaining filter-type keys that landed in entities by mistake.
-    // These are all the known filter keys — if any appear in entities, move them.
-    const FILTER_KEYS = [
-      "interviewer", "interviewStatus", "applicationStatus", "isQualified",
-      "hasFeedback", "marksObtained", "marksOperator", "hasAadhar", "hasPanCard",
-      "hasBankPassbook", "hasBankStatement", "hasSalarySlip", "hasExperienceLetter",
-      "hasOfferLetter", "hasItr", "resumeCount", "resumeCountOperator",
-      "hasLinkedin", "hasPortfolio", "ugDegree", "pgDegree", "hasPostGraduation",
-      "ugGraduationYear", "pgGraduationYear", "hasApplied",
-      "birthYear", "birthYearFrom", "birthYearTo",
-    ];
-    FILTER_KEYS.forEach((key) => {
-      if (normEntities[key] != null) {
-        normFilters[key] = normFilters[key] ?? normEntities[key];
-        delete normEntities[key];
+      const rawEntities = parsed.entities || {};
+      const rawFilters  = parsed.filters  || {};
+
+      // ── Normalise misplaced fields ────────────────────────────────────────
+      const normEntities = { ...rawEntities };
+      const normFilters  = { ...rawFilters, interviewRound: rawFilters.interviewRound || null };
+
+      if (normEntities.gender != null && normEntities.gender !== "") {
+        normFilters.gender = normFilters.gender || normEntities.gender;
+        delete normEntities.gender;
       }
-    });
+      if (normEntities.language != null && normEntities.language !== "") {
+        normFilters.languageKnown = normFilters.languageKnown || normEntities.language;
+        delete normEntities.language;
+      }
+      if (normEntities.languageKnown != null && normEntities.languageKnown !== "") {
+        normFilters.languageKnown = normFilters.languageKnown || normEntities.languageKnown;
+        delete normEntities.languageKnown;
+      }
+      ["isStudying","isVerified","isProfileComplete","hasExperience","isCurrentlyWorking",
+       "isShortlisted","isAccepted","hasInterview","hasResume"].forEach((key) => {
+        if (normEntities[key] != null) {
+          normFilters[key] = normFilters[key] ?? normEntities[key];
+          delete normEntities[key];
+        }
+      });
+      if (normEntities.interviewer != null && normEntities.interviewer !== "") {
+        normFilters.interviewer = normFilters.interviewer || normEntities.interviewer;
+        delete normEntities.interviewer;
+      }
 
-    // skill stays in entities (used by matchesEntity for skill matching)
-    // city / state stay in entities (used by matchesEntity for location matching)
-    // candidateName / email / jobTitle / companyName / universityName stay in entities
+      const FILTER_KEYS = [
+        "interviewer", "interviewStatus", "applicationStatus", "isQualified",
+        "hasFeedback", "marksObtained", "marksOperator", "hasAadhar", "hasPanCard",
+        "hasBankPassbook", "hasBankStatement", "hasSalarySlip", "hasExperienceLetter",
+        "hasOfferLetter", "hasItr", "resumeCount", "resumeCountOperator",
+        "hasLinkedin", "hasPortfolio", "ugDegree", "pgDegree", "hasPostGraduation",
+        "ugGraduationYear", "pgGraduationYear", "hasApplied",
+        "birthYear", "birthYearFrom", "birthYearTo","experienceYears", "experienceYearsOperator",
+  "experienceYearsFrom", "experienceYearsTo",
+      ];
+      FILTER_KEYS.forEach((key) => {
+        if (normEntities[key] != null) {
+          normFilters[key] = normFilters[key] ?? normEntities[key];
+          delete normEntities[key];
+        }
+      });
 
-    log.info(`[Normalised] entities: ${JSON.stringify(normEntities)} | filters: ${JSON.stringify(normFilters)}`);
+      log.info(`[Normalised] entities: ${JSON.stringify(normEntities)} | filters: ${JSON.stringify(normFilters)}`);
 
-    return {
-      intent: parsed.intent || "CANDIDATE",
-      limit: safeLimit,
-      entities: normEntities,
-      filters: normFilters,
-      sectionsNeeded: parsed.sectionsNeeded || "ALL",
-    };
-  } catch (err) {
-    log.error(
-      `analyzeQuestion failed: ${err.message} — defaulting to CANDIDATE/ALL`,
-    );
-    return {
-      intent: "CANDIDATE",
-      limit: null,
-      entities: {},
-      filters: {},
-      sectionsNeeded: "ALL",
-    };
+      const result = {
+        intent: parsed.intent || "CANDIDATE",
+        limit: safeLimit,
+        entities: normEntities,
+        filters: normFilters,
+        sectionsNeeded: parsed.sectionsNeeded || "ALL",
+      };
+
+      // ── Store in LRU cache ────────────────────────────────────────────────
+      analysisCache.set(cacheKey, { result, ts: Date.now() });
+      
+      if (analysisCache.size > ANALYSIS_CACHE_MAX) {
+        analysisCache.delete(analysisCache.keys().next().value);
+      }
+
+      return result;
+    } catch (err) {
+      lastError = err;
+      log.error(`analyzeQuestion attempt ${attempt}/2 failed: ${err.message}`);
+      if (attempt < 2) {
+        log.info("Retrying analyzeQuestion...");
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    }
   }
+
+  log.error(`analyzeQuestion failed after retry — defaulting to CANDIDATE/ALL. Last error: ${lastError?.message}`);
+  return {
+    intent: "CANDIDATE",
+    limit: null,
+    entities: {},
+    filters: {},
+    sectionsNeeded: "ALL",
+  };
+}
+
+// ── Schema validator ──────────────────────────────────────────────────────────
+
+function validateAnalysis(parsed) {
+  const validIntents = ["CANDIDATE", "COUNT", "PDF", "REPORT", "OOS"];
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  if (!validIntents.includes(parsed.intent)) return false;
+  if (parsed.entities !== null && parsed.entities !== undefined && typeof parsed.entities !== "object") return false;
+  if (parsed.filters  !== null && parsed.filters  !== undefined && typeof parsed.filters  !== "object") return false;
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -916,19 +1126,96 @@ JSON:`.trim();
 
 function filterCandidates(entities, filters = {}) {
   if (!candidateStore) return [];
-  const candidates = candidateStore.candidates;
-  const hasEntity = Object.values(entities).some((v) => v != null && v !== "");
-  const hasFilter = Object.values(filters).some((v) => v != null);
 
-  let pool = hasEntity
-    ? candidates.filter((c) => matchesEntity(c, entities))
-    : candidates;
-  if (hasFilter) pool = pool.filter((c) => matchesFilters(c, filters));
+  let pools = [];
+
+  // ─────────────────────────────
+  // STEP 1: COLLECT INDEX SETS
+  // ─────────────────────────────
+
+  if (entities.skill) {
+    const skillSet = candidateIndex.bySkill.get(entities.skill.toLowerCase()) || [];
+    pools.push(skillSet);
+  }
+
+  if (entities.city) {
+    const citySet = candidateIndex.byCity.get(entities.city.toLowerCase()) || [];
+    pools.push(citySet);
+  }
+
+  if (entities.state) {
+    const stateSet = candidateIndex.byState.get(entities.state.toLowerCase()) || [];
+    pools.push(stateSet);
+  }
+
+  if (entities.jobTitle) {
+    const jobSet = candidateIndex.byJobTitle.get(entities.jobTitle.toLowerCase()) || [];
+    pools.push(jobSet);
+  }
+
+  // ─────────────────────────────
+  // STEP 2: INTERSECTION (KEY FIX)
+  // ─────────────────────────────
+
+  let pool;
+
+  if (pools.length === 0) {
+    pool = candidateStore.candidates;
+  } else {
+    // take smallest set first (performance)
+    pools.sort((a, b) => a.length - b.length);
+
+    pool = pools[0];
+
+    for (let i = 1; i < pools.length; i++) {
+      const set = new Set(pools[i]);
+      pool = pool.filter(c => set.has(c));
+    }
+  }
+
+  // ─────────────────────────────
+  // STEP 3: APPLY REMAINING FILTERS
+  // ─────────────────────────────
+
+  pool = pool.filter(candidate => {
+
+    // company filter
+    if (entities.companyName) {
+      const match = (candidate.Experience || []).some(e =>
+        (e.companyName || "").toLowerCase().includes(entities.companyName.toLowerCase())
+      );
+      if (!match) return false;
+    }
+
+    // birth year
+    if (filters.birthYear != null) {
+      const dob = candidate.Profile?.dateOfBirth;
+      if (!dob) return false;
+
+      const year = new Date(dob).getFullYear();
+      if (year !== filters.birthYear) return false;
+    }
+
+    return matchesFilters(candidate, filters);
+  });
+
   return pool;
 }
 
+
+function detectResponseType(question) {
+  const q = question.toLowerCase();
+
+  if (q.includes("education")) return "WITH_EDUCATION";
+  if (q.includes("skill")) return "WITH_SKILLS";
+  if (q.includes("resume")) return "WITH_RESUME";
+  if (q.includes("experience")) return "WITH_EXPERIENCE";
+
+  return "DEFAULT";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// ENTITY MATCHING  (AND logic — all supplied entities must match)
+// ENTITY MATCHING
 // ─────────────────────────────────────────────────────────────────────────────
 
 function matchesEntity(candidate, entities) {
@@ -937,34 +1224,16 @@ function matchesEntity(candidate, entities) {
   if (entities.candidateName != null && entities.candidateName !== "") {
     const search = entities.candidateName.toLowerCase().trim();
     const fullName = (candidate.FullName || "").toLowerCase();
-
-    // Split search into words, keep all words (even short ones like "P.")
     const words = search.split(/\s+/).filter((w) => w.length > 0);
-
-    // 1. Direct substring match — handles "naresh prajapati" → "Naresh Prajapati"
     const directMatch = fullName.includes(search);
-
-    // 2. Multi-word AND match — ALL words must appear in the full name.
-    //    "naresh prajapati" → both "naresh" AND "prajapati" must be in the name.
-    //    This is the critical fix: prevents "Kalash Prajapati" from matching
-    //    when the user searched for "naresh prajapati".
-    //    Only meaningful words (length > 1) are required to all match.
     const meaningfulWords = words.filter((w) => w.length > 1);
     const multiWordMatch = meaningfulWords.length >= 2
       && meaningfulWords.every((w) => fullName.includes(w));
-
-    // 3. Single-word search → partial match (e.g. "avinash" matches "Avinash Patel")
-    //    Only used when the user typed a single name token.
     const singleWordMatch = meaningfulWords.length === 1
       && fullName.includes(meaningfulWords[0]);
-
-    // Strict priority: direct match first, then multi-word AND, then single word.
-    // Never fall back to single-word if a multi-word search was given —
-    // that is what caused "Kalash Prajapati" to appear for "naresh prajapati".
     const nameMatch = meaningfulWords.length >= 2
-      ? (directMatch || multiWordMatch)   // multi-word: require BOTH words
-      : (directMatch || singleWordMatch); // single-word: partial is fine
-
+      ? (directMatch || multiWordMatch)
+      : (directMatch || singleWordMatch);
     checks.push(nameMatch);
   }
 
@@ -974,20 +1243,27 @@ function matchesEntity(candidate, entities) {
     );
   }
 
+  // ── City: exact match or "starts with word boundary" guard ───────────────
   if (entities.city != null && entities.city !== "") {
-    checks.push(
-      (candidate.Profile?.city || "")
-        .toLowerCase()
-        .includes(entities.city.toLowerCase()),
-    );
+    const cityVal   = (candidate.Profile?.city || "").toLowerCase().trim();
+    const cityQuery = entities.city.toLowerCase().trim();
+   
+    const cityMatch =
+      cityVal === cityQuery ||
+      cityVal.startsWith(cityQuery + " ") ||
+      cityVal.includes(cityQuery); 
+    checks.push(cityMatch);
   }
 
+  // ── State: same guard as city ─────────────────────────────────────────────
   if (entities.state != null && entities.state !== "") {
-    checks.push(
-      (candidate.Profile?.state || "")
-        .toLowerCase()
-        .includes(entities.state.toLowerCase()),
-    );
+    const stateVal   = (candidate.Profile?.state || "").toLowerCase().trim();
+    const stateQuery = entities.state.toLowerCase().trim();
+    const stateMatch =
+      stateVal === stateQuery ||
+      stateVal.startsWith(stateQuery + " ") ||
+      stateVal.includes(stateQuery);
+    checks.push(stateMatch);
   }
 
   if (entities.skill != null && entities.skill !== "") {
@@ -1054,31 +1330,19 @@ function matchesEntity(candidate, entities) {
 function matchesFilters(candidate, filters) {
   // ── ROOT ──────────────────────────────────────────────────────────────────
   if (filters.isVerified != null) {
-    if (Boolean(candidate.isVerified) !== Boolean(filters.isVerified))
-      return false;
+    if (Boolean(candidate.isVerified) !== Boolean(filters.isVerified)) return false;
   }
   if (filters.isProfileComplete != null) {
-    if (
-      Boolean(candidate.isProfileComplete) !==
-      Boolean(filters.isProfileComplete)
-    )
-      return false;
+    if (Boolean(candidate.isProfileComplete) !== Boolean(filters.isProfileComplete)) return false;
   }
 
   // ── PROFILE ───────────────────────────────────────────────────────────────
   if (filters.isStudying != null) {
-    // Skip isStudying filter when a graduation year is also set.
-    // "completed study in 2019" → LLM sets isStudying: false, but many
-    // candidates have isStudying = null (not filled in). The graduation
-    // year filter is more accurate for this intent.
     const hasGradYearFilter =
       filters.ugGraduationYear != null || filters.pgGraduationYear != null;
     if (!hasGradYearFilter) {
-      // Only apply isStudying when the profile field is explicitly set (not null).
-      // Candidates who never filled in isStudying should not be excluded.
       const val = candidate.Profile?.isStudying;
-      if (val != null && Boolean(val) !== Boolean(filters.isStudying))
-        return false;
+      if (val != null && Boolean(val) !== Boolean(filters.isStudying)) return false;
     }
   }
   if (filters.gender) {
@@ -1099,15 +1363,11 @@ function matchesFilters(candidate, filters) {
   }
 
   // ── BIRTHDATE / AGE ───────────────────────────────────────────────────────
-  // dateOfBirth is stored as ISO string e.g. "2000-05-15T18:30:00Z"
-  // We extract the birth year and compare against the filter.
   if (filters.birthYear != null || filters.birthYearFrom != null || filters.birthYearTo != null) {
     const dob = candidate.Profile?.dateOfBirth;
-    // If no DOB recorded, exclude — we can't verify the birthdate range
     if (!dob || dob === "" || dob === null) return false;
     const birthYear = parseInt(String(dob).split("-")[0], 10);
     if (isNaN(birthYear) || birthYear < 1900 || birthYear > 2100) return false;
-
     if (filters.birthYear != null && birthYear !== Number(filters.birthYear)) return false;
     if (filters.birthYearFrom != null && birthYear < Number(filters.birthYearFrom)) return false;
     if (filters.birthYearTo != null && birthYear > Number(filters.birthYearTo)) return false;
@@ -1117,24 +1377,22 @@ function matchesFilters(candidate, filters) {
   if (filters.ugDegree) {
     const edu = candidate.Education || [];
     const ugQuery = filters.ugDegree.toLowerCase().trim();
-
     const UG_ALIASES = {
-      "btech":    ["bachelor of technology", "b.tech", "b.e."],
-      "be":       ["bachelor of engineering", "b.e."],
-      "bca":      ["bachelor of computer", "bca"],
-      "bsc":      ["bachelor of science", "b.sc"],
-      "ba":       ["bachelor of arts", "b.a."],
-      "bcom":     ["bachelor of commerce", "b.com"],
-      "bba":      ["bachelor of business", "bba", "bbm"],
-      "bbm":      ["bachelor of business", "bbm"],
-      "barch":    ["bachelor of architecture", "b.arch"],
-      "bachelors":["bachelor"],
-      "bachelor": ["bachelor"],
-      "degree":   ["bachelor", "master"],
+      "btech":     ["bachelor of technology", "b.tech", "b.e."],
+      "be":        ["bachelor of engineering", "b.e."],
+      "bca":       ["bachelor of computer", "bca"],
+      "bsc":       ["bachelor of science", "b.sc"],
+      "ba":        ["bachelor of arts", "b.a."],
+      "bcom":      ["bachelor of commerce", "b.com"],
+      "bba":       ["bachelor of business", "bba", "bbm"],
+      "bbm":       ["bachelor of business", "bbm"],
+      "barch":     ["bachelor of architecture", "b.arch"],
+      "bachelors": ["bachelor"],
+      "bachelor":  ["bachelor"],
+      "degree":    ["bachelor", "master"],
       "graduation":["bachelor"],
-      "undergrad":["bachelor"],
+      "undergrad": ["bachelor"],
     };
-
     const keywords = UG_ALIASES[ugQuery] || [ugQuery];
     const match = edu.some((e) => {
       const deg = (e.UnderGraduationDegree || "").toLowerCase();
@@ -1145,25 +1403,21 @@ function matchesFilters(candidate, filters) {
   if (filters.pgDegree) {
     const edu = candidate.Education || [];
     const pgQuery = filters.pgDegree.toLowerCase().trim();
-
-    // Expand generic degree terms to keywords that actually appear in DB values.
-    // e.g. "Masters" → matches "Master of Technology", "Master of Arts", "M.Tech" etc.
     const PG_ALIASES = {
-      "masters":  ["master"],
-      "master":   ["master"],
-      "master degree": ["master"],
+      "masters":        ["master"],
+      "master":         ["master"],
+      "master degree":  ["master"],
       "masters degree": ["master"],
-      "pg":       ["master", "m."],
-      "mtech":    ["master of technology", "m.tech", "m.e."],
-      "mba":      ["master of business", "mba"],
-      "mca":      ["master of computer", "mca"],
-      "msc":      ["master of science", "m.sc"],
-      "ma":       ["master of arts", "m.a."],
-      "mcom":     ["master of commerce", "m.com"],
-      "me":       ["master of engineering", "m.e."],
-      "march":    ["master of architecture", "m.arch"],
+      "pg":             ["master", "m."],
+      "mtech":          ["master of technology", "m.tech", "m.e."],
+      "mba":            ["master of business", "mba"],
+      "mca":            ["master of computer", "mca"],
+      "msc":            ["master of science", "m.sc"],
+      "ma":             ["master of arts", "m.a."],
+      "mcom":           ["master of commerce", "m.com"],
+      "me":             ["master of engineering", "m.e."],
+      "march":          ["master of architecture", "m.arch"],
     };
-
     const keywords = PG_ALIASES[pgQuery] || [pgQuery];
     const match = edu.some((e) => {
       const deg = (e.PostGraduationDegree || "").toLowerCase();
@@ -1172,9 +1426,6 @@ function matchesFilters(candidate, filters) {
     if (!match) return false;
   }
   if (filters.hasPostGraduation != null) {
-    // Skip this check if pgDegree is already set — pgDegree implies hasPostGraduation.
-    // This prevents double-filtering where pgDegree passes but hasPostGraduation
-    // runs a stricter check and rejects the same candidate.
     if (!filters.pgDegree) {
       const edu = candidate.Education || [];
       const hasPg = edu.some(
@@ -1186,27 +1437,18 @@ function matchesFilters(candidate, filters) {
   if (filters.ugGraduationYear != null) {
     const edu = candidate.Education || [];
     const target = Number(filters.ugGraduationYear);
-
+    const parseYear = (val) => {
+      if (val == null || val === "" || val === "null") return null;
+      if (typeof val === "string" && val.includes("-")) {
+        const y = parseInt(val.split("-")[0], 10);
+        return isNaN(y) ? null : y;
+      }
+      const n = parseInt(String(val), 10);
+      return isNaN(n) ? null : n;
+    };
     const match = edu.some((e) => {
-      const ugRaw = e.underGraduationEndYear;
-      const pgRaw = e.postGraduationEndYear;
-
-      // Handle all possible storage formats:
-      // number: 2019, float: 2019.0, string: "2019", "2019-01-01", null, ""
-      const parseYear = (val) => {
-        if (val == null || val === "" || val === "null") return null;
-        // If it looks like a date string "2019-01-01", extract the year part
-        if (typeof val === "string" && val.includes("-")) {
-          const y = parseInt(val.split("-")[0], 10);
-          return isNaN(y) ? null : y;
-        }
-        const n = parseInt(String(val), 10);
-        return isNaN(n) ? null : n;
-      };
-
-      const ugYear = parseYear(ugRaw);
-      const pgYear = parseYear(pgRaw);
-
+      const ugYear = parseYear(e.underGraduationEndYear);
+      const pgYear = parseYear(e.postGraduationEndYear);
       return ugYear === target ||
         (filters.pgGraduationYear == null && pgYear === target);
     });
@@ -1227,19 +1469,30 @@ function matchesFilters(candidate, filters) {
   }
 
   // ── EXPERIENCE ────────────────────────────────────────────────────────────
-  if (filters.isCurrentlyWorking != null) {
-    const realExp = (candidate.Experience || []).filter(
-      (e) => e.companyName && e.companyName.trim() !== "",
-    );
-    const working = realExp.some((e) => Boolean(e.isCurrentCompany));
-    if (working !== Boolean(filters.isCurrentlyWorking)) return false;
+if (
+  filters.experienceYears != null ||
+  filters.experienceYearsFrom != null ||
+  filters.experienceYearsTo != null
+) {
+  const totalYears = getTotalExperienceYears(candidate);
+
+  if (filters.experienceYears != null) {
+    const target = Number(filters.experienceYears);
+    const op = filters.experienceYearsOperator || "eq";
+    const TOLERANCE = 0.5; 
+    const passes =
+      op === "eq"  ? Math.abs(totalYears - target) <= TOLERANCE :
+      op === "gt"  ? totalYears > target :
+      op === "lt"  ? totalYears < target :
+      op === "gte" ? totalYears >= target - TOLERANCE :
+      op === "lte" ? totalYears <= target + TOLERANCE :
+                     Math.abs(totalYears - target) <= TOLERANCE;
+    if (!passes) return false;
   }
-  if (filters.hasExperience != null) {
-    const hasExp = (candidate.Experience || []).some(
-      (e) => e.companyName && e.companyName.trim() !== "",
-    );
-    if (hasExp !== Boolean(filters.hasExperience)) return false;
-  }
+
+  if (filters.experienceYearsFrom != null && totalYears < Number(filters.experienceYearsFrom)) return false;
+  if (filters.experienceYearsTo   != null && totalYears > Number(filters.experienceYearsTo))   return false;
+}
 
   // ── APPLICATIONS ──────────────────────────────────────────────────────────
   if (filters.isShortlisted != null) {
@@ -1267,67 +1520,55 @@ function matchesFilters(candidate, filters) {
   }
 
   // ── INTERVIEWS ────────────────────────────────────────────────────────────
+  
+  const safeInterviews = (candidate.Applications || []).flatMap(
+    (a) => (Array.isArray(a.Interviews) ? a.Interviews : []),
+  );
+
   if (filters.isQualified != null) {
-    const match = (candidate.Applications || []).some((app) =>
-      (app.Interviews || []).some(
-        (i) => Boolean(i.isQualified) === Boolean(filters.isQualified),
-      ),
+    const match = safeInterviews.some(
+      (i) => Boolean(i.isQualified) === Boolean(filters.isQualified),
     );
     if (!match) return false;
   }
   if (filters.hasInterview != null) {
-    const allInterviews = (candidate.Applications || []).flatMap(
-      (a) => a.Interviews || [],
-    );
-    const hasIt = allInterviews.length > 0;
+    const hasIt = safeInterviews.length > 0;
     if (hasIt !== Boolean(filters.hasInterview)) return false;
   }
   if (filters.hasFeedback != null) {
-    const allInterviews = (candidate.Applications || []).flatMap(
-      (a) => a.Interviews || [],
-    );
-    const hasIt = allInterviews.some(
+    const hasIt = safeInterviews.some(
       (i) => i.feedback && i.feedback.trim() !== "",
     );
     if (hasIt !== Boolean(filters.hasFeedback)) return false;
   }
   if (filters.interviewer) {
     const target = filters.interviewer.toLowerCase().trim();
-    const match = (candidate.Applications || []).some((app) =>
-      (app.Interviews || []).some((i) =>
-        (i.Interviewer || "").toLowerCase().includes(target),
-      ),
+    const match = safeInterviews.some((i) =>
+      (i.Interviewer || "").toLowerCase().includes(target),
     );
     if (!match) return false;
   }
   if (filters.interviewStatus) {
     const target = filters.interviewStatus.toLowerCase();
-    const match = (candidate.Applications || []).some((app) =>
-      (app.Interviews || []).some((i) =>
-        (i.InterviewStatus || "").toLowerCase().includes(target),
-      ),
+    const match = safeInterviews.some((i) =>
+      (i.InterviewStatus || "").toLowerCase().includes(target),
     );
     if (!match) return false;
   }
   if (filters.marksObtained != null) {
     const target = Number(filters.marksObtained);
     const op = filters.marksOperator || "eq";
-    const allMarks = (candidate.Applications || []).flatMap((app) =>
-      (app.Interviews || [])
-        .map((i) => i.marksObtained)
-        .filter((m) => m != null)
-        .map(Number),
-    );
+   const allMarks = safeInterviews
+      .map((i) => parseFloat(i.marksObtained))
+      .filter((m) => !isNaN(m));
     if (allMarks.length === 0) return false;
     const passes = allMarks.some((m) => {
-      // Use Math.round to handle float storage (e.g. 30.0 === 30)
-      const mRounded = Math.round(m * 100) / 100;
-      if (op === "eq") return Math.abs(mRounded - target) < 0.01;
-      if (op === "gt") return mRounded > target;
-      if (op === "lt") return mRounded < target;
-      if (op === "gte") return mRounded >= target;
-      if (op === "lte") return mRounded <= target;
-      return Math.abs(mRounded - target) < 0.01;
+      if (op === "eq")  return Math.abs(m - target) < 0.01;
+      if (op === "gt")  return m > target;
+      if (op === "lt")  return m < target;
+      if (op === "gte") return m >= target;
+      if (op === "lte") return m <= target;
+      return Math.abs(m - target) < 0.01;
     });
     if (!passes) return false;
   }
@@ -1350,8 +1591,7 @@ function matchesFilters(candidate, filters) {
     if (!!doc.salarySlip !== Boolean(filters.hasSalarySlip)) return false;
   }
   if (filters.hasExperienceLetter != null) {
-    if (!!doc.expierenceLetter !== Boolean(filters.hasExperienceLetter))
-      return false;
+    if (!!doc.expierenceLetter !== Boolean(filters.hasExperienceLetter)) return false;
   }
   if (filters.hasOfferLetter != null) {
     if (!!doc.offerLetter !== Boolean(filters.hasOfferLetter)) return false;
@@ -1360,7 +1600,7 @@ function matchesFilters(candidate, filters) {
     if (!!doc.itr !== Boolean(filters.hasItr)) return false;
   }
 
-  // ── RESUMES ───────────────────────────────────────────────────────────────
+
   if (filters.hasResume != null) {
     const hasIt = (candidate.Resumes || []).some(
       (r) => r.resume && r.resume.trim() !== "",
@@ -1374,17 +1614,12 @@ function matchesFilters(candidate, filters) {
     const target = Number(filters.resumeCount);
     const op = filters.resumeCountOperator || "eq";
     const passes =
-      op === "eq"
-        ? count === target
-        : op === "gt"
-          ? count > target
-          : op === "lt"
-            ? count < target
-            : op === "gte"
-              ? count >= target
-              : op === "lte"
-                ? count <= target
-                : count === target;
+      op === "eq"  ? count === target :
+      op === "gt"  ? count > target   :
+      op === "lt"  ? count < target   :
+      op === "gte" ? count >= target  :
+      op === "lte" ? count <= target  :
+                     count === target;
     if (!passes) return false;
   }
 
@@ -1394,76 +1629,70 @@ function matchesFilters(candidate, filters) {
 // ─────────────────────────────────────────────────────────────────────────────
 // getSummarySections
 // ─────────────────────────────────────────────────────────────────────────────
-// Returns the minimal set of DB sections needed for a LIST query.
-// For a single-candidate detail query, ALL_SECTIONS is used instead.
-//
-// Rules:
-//   • Always include root + Profile (name, city, state are always useful).
-//   • Include Skills always (useful in every list).
-//   • Include Education only when an education filter was applied.
-//   • Include Experience only when an experience filter was applied.
-//   • Include Applications (+Interviews) when any application/interview
-//     filter was applied, OR when the LLM sectionsNeeded said to include it.
-//   • Never include Documents or Resumes for list views — not useful in a table.
 
 function getSummarySections(filters, llmSectionsNeeded) {
+  
+  const llmIsRootOnly =
+    Array.isArray(llmSectionsNeeded) &&
+    llmSectionsNeeded.length === 1 &&
+    llmSectionsNeeded[0] === "root";
+
+  if (llmIsRootOnly) {
+    
+    const needsEducation =
+      filters.ugDegree || filters.pgDegree ||
+      filters.hasPostGraduation != null ||
+      filters.ugGraduationYear != null || filters.pgGraduationYear != null;
+    const needsExperience =
+      filters.hasExperience != null || filters.isCurrentlyWorking != null;
+    const needsApplications =
+      filters.isShortlisted != null || filters.isAccepted != null ||
+      filters.hasApplied != null || filters.applicationStatus ||
+      filters.hasInterview != null || filters.interviewStatus ||
+      filters.interviewer || filters.isQualified != null ||
+      filters.hasFeedback != null || filters.marksObtained != null;
+
+    const sections = new Set(["root"]);
+    if (needsEducation)    sections.add("Education");
+    if (needsExperience)   sections.add("Experience");
+    if (needsApplications) { sections.add("Applications"); sections.add("Applications.Interviews"); }
+    return [...sections];
+  }
+
+
   const sections = new Set(["root", "Profile", "Skills"]);
 
-  // Birthdate filters — always include Profile section
   if (filters.birthYear != null || filters.birthYearFrom != null || filters.birthYearTo != null) {
     sections.add("Profile");
   }
-
-  // Education filters — always include Education section when any edu filter is set
   if (
-    filters.ugDegree ||
-    filters.pgDegree ||
+    filters.ugDegree || filters.pgDegree ||
     filters.hasPostGraduation != null ||
-    filters.ugGraduationYear != null ||
-    filters.pgGraduationYear != null
+    filters.ugGraduationYear != null || filters.pgGraduationYear != null
   ) {
     sections.add("Education");
   }
-
-  // Also add Education when sectionsNeeded from LLM is missing it but
-  // we have education-related filters — prevents "0 results" from missing data
-  if ((filters.pgDegree || filters.ugDegree || filters.hasPostGraduation != null)
-      && Array.isArray(llmSectionsNeeded)
-      && !llmSectionsNeeded.includes("Education")) {
-    sections.add("Education");
-  }
-
-  // Experience filters
   if (filters.hasExperience != null || filters.isCurrentlyWorking != null) {
     sections.add("Experience");
   }
-
-  // Application / interview filters
   if (
-    filters.isShortlisted != null ||
-    filters.isAccepted != null ||
-    filters.hasApplied != null ||
-    filters.applicationStatus ||
-    filters.hasInterview != null ||
-    filters.interviewStatus ||
-    filters.interviewer ||
-    filters.isQualified != null ||
-    filters.hasFeedback != null ||
-    filters.marksObtained != null
+    filters.isShortlisted != null || filters.isAccepted != null ||
+    filters.hasApplied != null || filters.applicationStatus ||
+    filters.hasInterview != null || filters.interviewStatus ||
+    filters.interviewer || filters.isQualified != null ||
+    filters.hasFeedback != null || filters.marksObtained != null
   ) {
     sections.add("Applications");
     sections.add("Applications.Interviews");
   }
 
-  // Also respect specific section hints from the LLM (but never Documents/Resumes)
+ 
+  const allowed = new Set([
+    "root", "Profile", "Skills", "Education", "Experience",
+    "Applications", "Applications.Interviews",
+  ]);
   if (Array.isArray(llmSectionsNeeded)) {
-    const allowed = new Set(["root", "Profile", "Skills", "Education", "Experience", "Applications", "Applications.Interviews"]);
     llmSectionsNeeded.forEach((s) => { if (allowed.has(s)) sections.add(s); });
-  }
-
-  // Always include Applications for shortlisted/accepted display
-  if (!sections.has("Applications")) {
-    sections.add("Applications");
   }
 
   return [...sections];
@@ -1505,55 +1734,90 @@ function projectData(candidates, sectionsNeeded) {
   });
 }
 
+
+function getTotalExperienceYears(candidate) {
+  const experiences = (candidate.Experience || []).filter(
+    (e) => e.companyName && e.companyName.trim() !== "" && e.startDate
+  );
+  if (experiences.length === 0) return 0;
+
+  let totalMs = 0;
+  const now = new Date();
+
+  for (const exp of experiences) {
+    const start = new Date(exp.startDate);
+    if (isNaN(start.getTime())) continue;
+
+    const end = exp.isCurrentCompany || !exp.endDate
+      ? now
+      : new Date(exp.endDate);
+
+    if (isNaN(end.getTime())) continue;
+
+    const diff = end.getTime() - start.getTime();
+    if (diff > 0) totalMs += diff;
+  }
+
+  return totalMs / (1000 * 60 * 60 * 24 * 365.25); // returns decimal years
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildFilterLabel(entities, filters) {
+ 
+  const parts = [];
+
   if (entities?.candidateName) return `named "${entities.candidateName}"`;
-  if (entities?.jobTitle) return `applied for "${entities.jobTitle}"`;
-  if (entities?.skill) return `with skill "${entities.skill}"`;
-  if (entities?.city) return `from "${entities.city}"`;
-  if (entities?.companyName) return `who worked at "${entities.companyName}"`;
-  if (entities?.universityName)
-    return `from "${entities.universityName}" university/college`;
-  if (filters.isStudying === true) return "currently studying";
-  if (filters.isStudying === false) return "not currently studying";
-  if (filters.isShortlisted === true) return "shortlisted";
-  if (filters.isVerified === true) return "verified";
-  if (filters.isVerified === false) return "unverified";
-  if (filters.isProfileComplete === true) return "with complete profile";
-  if (filters.isProfileComplete === false) return "with incomplete profile";
-  if (filters.hasExperience === false)
-    return "with no work experience (freshers)";
-  if (filters.hasExperience === true) return "with work experience";
-  if (filters.isCurrentlyWorking === true) return "currently working";
-  if (filters.gender) return `who are ${filters.gender}`;
-  if (filters.languageKnown) return `who speak ${filters.languageKnown}`;
-  if (filters.ugDegree) return `with ${filters.ugDegree} degree`;
-  if (filters.pgDegree) return `with ${filters.pgDegree} degree`;
-  if (filters.hasPostGraduation === true) return "with post-graduation degree";
-  if (filters.hasPostGraduation === false)
-    return "without post-graduation degree";
-  if (filters.applicationStatus)
-    return `with application status "${filters.applicationStatus}"`;
-  if (filters.interviewStatus)
-    return `with interview status "${filters.interviewStatus}"`;
-  if (filters.isQualified === true) return "who qualified the interview";
-  if (filters.isQualified === false) return "who did not qualify the interview";
+  if (entities?.jobTitle)      parts.push(`applied for "${entities.jobTitle}"`);
+  if (entities?.skill)         parts.push(`with skill "${entities.skill}"`);
+  if (entities?.city)          parts.push(`from "${entities.city}"`);
+  if (entities?.state)         parts.push(`from "${entities.state}"`);
+  if (entities?.companyName)   parts.push(`who worked at "${entities.companyName}"`);
+  if (entities?.universityName) parts.push(`from "${entities.universityName}" university/college`);
+
+  if (filters.isStudying === true)           parts.push("currently studying");
+  if (filters.isStudying === false)          parts.push("not currently studying");
+  if (filters.isShortlisted === true)        parts.push("shortlisted");
+  if (filters.isVerified === true)           parts.push("verified");
+  if (filters.isVerified === false)          parts.push("unverified");
+  if (filters.isProfileComplete === true)    parts.push("with complete profile");
+  if (filters.isProfileComplete === false)   parts.push("with incomplete profile");
+  if (filters.hasExperience === false)       parts.push("with no work experience (freshers)");
+  if (filters.hasExperience === true)        parts.push("with work experience");
+  if (filters.isCurrentlyWorking === true)   parts.push("currently working");
+  if (filters.gender)                        parts.push(`who are ${filters.gender}`);
+  if (filters.languageKnown)                 parts.push(`who speak ${filters.languageKnown}`);
+  if (filters.ugDegree)                      parts.push(`with ${filters.ugDegree} degree`);
+  if (filters.pgDegree)                      parts.push(`with ${filters.pgDegree} degree`);
+  if (filters.hasPostGraduation === true)    parts.push("with post-graduation degree");
+  if (filters.hasPostGraduation === false)   parts.push("without post-graduation degree");
+  if (filters.applicationStatus)             parts.push(`with application status "${filters.applicationStatus}"`);
+  if (filters.interviewStatus)               parts.push(`with interview status "${filters.interviewStatus}"`);
+  if (filters.isQualified === true)          parts.push("who qualified the interview");
+  if (filters.isQualified === false)         parts.push("who did not qualify the interview");
   if (filters.marksObtained != null) {
     const opLabel = {
-      eq: "exactly",
-      gt: "more than",
-      lt: "less than",
-      gte: "at least",
-      lte: "at most",
+      eq: "exactly", gt: "more than", lt: "less than", gte: "at least", lte: "at most",
     }[filters.marksOperator || "eq"];
-    return `who scored ${opLabel} ${filters.marksObtained} marks`;
+    parts.push(`who scored ${opLabel} ${filters.marksObtained} marks`);
   }
-  if (filters.hasResume === true) return "with uploaded resume";
-  if (filters.hasResume === false) return "with no resume uploaded";
-  if (filters.hasAadhar === false) return "with missing Aadhar card";
-  if (filters.hasPanCard === false) return "with missing PAN card";
-  return "matching your query";
+  if (filters.hasResume === true)   parts.push("with uploaded resume");
+  if (filters.hasResume === false)  parts.push("with no resume uploaded");
+  if (filters.hasAadhar === false)  parts.push("with missing Aadhar card");
+  if (filters.hasPanCard === false) parts.push("with missing PAN card");
+  if (filters.experienceYears != null) {
+  const opLabel = {
+    eq: "exactly", gt: "more than", lt: "less than", gte: "at least", lte: "at most",
+  }[filters.experienceYearsOperator || "eq"];
+  parts.push(`with ${opLabel} ${filters.experienceYears} year(s) of experience`);
+}
+if (filters.experienceYearsFrom != null || filters.experienceYearsTo != null) {
+  const from = filters.experienceYearsFrom ?? "?";
+  const to   = filters.experienceYearsTo   ?? "?";
+  parts.push(`with ${from}–${to} years of experience`);
+}
+
+  return parts.length ? parts.join(", ") : "matching your query";
 }
