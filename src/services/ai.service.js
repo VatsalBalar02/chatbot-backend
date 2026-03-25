@@ -59,7 +59,7 @@ REPORT — user explicitly asks to generate or download a report/PDF document.
   Examples: "generate a report", "export as PDF", "create a report of all interviews"
 
 OUT_OF_SCOPE — completely unrelated to recruitment, HR, candidates, or jobs.
-  Examples: "what is 2+2", "hi", "write a poem", "what is Python", "tell me a joke"
+  Examples: "what is 2+2", "write a poem", "what is Python", "tell me a joke"
 
 DECISION RULES (apply in order):
 1. If question mentions a SPECIFIC candidate, job, user, location, salary, or skill → SQL
