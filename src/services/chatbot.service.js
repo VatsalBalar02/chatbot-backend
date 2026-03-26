@@ -1,12 +1,3 @@
-// src/services/chatbot.service.js
-// ============================================================
-// Improvements applied:
-//  1. pushHistory now stores "(streamed response)" placeholder when
-//     result.answer is null — fixes broken history for candidate queries
-//  2. resetConversation now also resets conversation context in cache
-//  3. Input sanitisation applied before routing
-// ============================================================
-
 import { loadPdfVectorstore } from "./rag.service.js";
 import { runPdfMode } from "./rag.service.js";
 import { runReportMode } from "./report.service.js";
@@ -28,7 +19,6 @@ export async function init() {
     log.info("Step 2/2: Candidate cache ready.");
   } catch (err) {
     log.warn(`Step 2/2: Candidate cache warm-up failed — ${err.message}`);
-    // Non-fatal: server continues, next request will retry warm-up
   }
 
   log.info("========================================");
@@ -42,7 +32,6 @@ export function getVectorstore() {
 
 export function resetConversation() {
   conversationHistory = [];
-  // Also reset cross-turn candidate context (e.g. "his skills" references)
   resetConversationContext();
   log.info("Conversation history and context cleared.");
 }
@@ -65,8 +54,6 @@ function runOutOfScope(question) {
 }
 
 function pushHistory(question, answer) {
-  // When streaming, result.answer is null — store a placeholder so history
-  // is always populated and multi-turn context works correctly.
   const historyAnswer = answer ?? "(streamed response)";
   conversationHistory.push({ role: "user", content: question });
   conversationHistory.push({ role: "assistant", content: historyAnswer });
@@ -75,29 +62,67 @@ function pushHistory(question, answer) {
   }
 }
 
+// ── Pronoun expander ─────────────────────────────────────────────────────────
+// Expands "his skills" → "Dilip Prajapat skills" using last known candidate
+// This runs BEFORE answerFromCache so GPT never sees raw pronouns
+// ─────────────────────────────────────────────────────────────────────────────
+const PRONOUN_RE = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
+const POSSESSIVE_RE = /\b(his|her|their)\b/gi;
+const SUBJECT_RE = /\b(he|she|they|them|this person|the candidate|this candidate)\b/gi;
+
+let lastKnownCandidate = null; // track here in service layer too as safety net
+
+function expandPronouns(question) {
+  if (!PRONOUN_RE.test(question)) return question;
+  if (!lastKnownCandidate) return question;
+
+  // Remove pronouns and prepend candidate name
+  const stripped = question
+    .replace(POSSESSIVE_RE, "")   // remove "his", "her", "their"
+    .replace(SUBJECT_RE, "")      // remove "he", "she", "they" etc
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const expanded = `${lastKnownCandidate} ${stripped}`.trim();
+  log.info(`[PronounExpand] "${question}" → "${expanded}"`);
+  return expanded;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN ENTRY POINT
-//
-// onChunk — optional (text: string) => void
-//           Plain string callback. Each call = one token or one table block.
-//           The controller wraps this into SSE { type:"token", text } format.
 // ─────────────────────────────────────────────────────────────────────────────
 export async function chatbot(question, onChunk = null) {
   if (!question?.trim()) return runOutOfScope("(empty message)");
 
   question = question.trim();
-  log.info(`\nQuestion: "${question}"`);
 
-  // Pass onChunk inside the options object — answerFromCache expects { onChunk }
+  // ── Step 1: expand pronouns before any routing ───────────────────────────
+  const originalQuestion = question;
+  question = expandPronouns(question);
+
+  log.info(`\nQuestion: "${originalQuestion}"${question !== originalQuestion ? ` → expanded: "${question}"` : ""}`);
+
+  // ── Step 2: route to cache ───────────────────────────────────────────────
   const result = await answerFromCache(question, { onChunk });
 
   if (result.success) {
     log.info("-> Route: CANDIDATE CACHE");
-    // Fix: always push to history even when streaming (answer may be null)
-    pushHistory(question, result.answer);
+
+    // Track last resolved candidate for pronoun expansion
+    if (result.isSingleCandidate && result.entities?.candidateName) {
+      lastKnownCandidate = result.entities.candidateName;
+      log.info(`[PronounTrack] lastKnownCandidate = "${lastKnownCandidate}"`);
+    }
+
+    // Clear candidate tracking when switching to list queries
+    if (!result.isSingleCandidate) {
+      lastKnownCandidate = null;
+    }
+
+    pushHistory(originalQuestion, result.answer);
     return {
       type: "CANDIDATE",
-      answer: result.answer, // null when streaming — controller handles this
+      answer: result.answer,
       dataframe: result.dataframe,
     };
   }
@@ -108,17 +133,21 @@ export async function chatbot(question, onChunk = null) {
   if (intent === "PDF") {
     log.info("-> Route: PDF");
     const r = await runPdfMode(question, conversationHistory, vectorstore);
-    pushHistory(question, r.answer);
+    pushHistory(originalQuestion, r.answer);
     return r;
   }
 
   if (intent === "REPORT") {
     log.info("-> Route: REPORT");
     const r = await runReportMode(question, conversationHistory);
-    pushHistory(question, r.answer);
+    pushHistory(originalQuestion, r.answer);
     return r;
   }
 
-  log.info("-> Route: OUT OF SCOPE");
-  return runOutOfScope(question);
+  // ── OOS fallback ─────────────────────────────────────────────────────────
+  // Only retry if the original question had a pronoun and we expanded it —
+  // meaning the expanded version was already tried above. If it still failed,
+  // it is genuinely OOS. Do NOT retry the same question blindly.
+  log.info("-> Final Route: OUT OF SCOPE");
+  return runOutOfScope(originalQuestion);
 }

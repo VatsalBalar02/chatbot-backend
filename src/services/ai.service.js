@@ -21,7 +21,41 @@ export function getOpenAIClient() {
   return openaiClient;
 }
 
-export async function classifyIntent(question) {
+export async function classifyIntent(question,contextMemory={}) {
+
+  // 🔥 CONTEXT-AWARE SHORT QUERY FIX
+const shortQuery = question.toLowerCase().trim();
+
+const vagueDataQueries = [
+  "interview",
+  "interview date",
+  "interview status",
+  "education",
+  "skills",
+  "experience",
+  "job",
+  "application"
+];
+
+const isVague = vagueDataQueries.some(q => shortQuery.includes(q));
+
+if (isVague) {
+  // if we have previous context → it's SQL
+  if (question.trim().split(" ").length <= 3) {
+  if (contextMemory?.candidateName) {
+    log.info("[IntentFix] Short follow-up → SQL");
+    return "SQL";
+  }
+}
+  if (contextMemory?.candidateName) {
+    log.info("[IntentFix] Context-based SQL (vague query)");
+    return "SQL";
+  }
+
+  // even without context, still likely SQL
+  log.info("[IntentFix] Vague data query → SQL");
+  return "SQL";
+}
   const client = getOpenAIClient();
 
   const INTENT_SYSTEM = `
@@ -75,7 +109,16 @@ Respond with ONLY the label: SQL, PDF, REPORT, or OUT_OF_SCOPE
     model: "gpt-4o-mini",
     messages: [
       { role: "system", content: INTENT_SYSTEM },
-      { role: "user", content: question },
+      {
+  role: "user",
+  content: `
+Conversation context:
+Candidate: ${contextMemory?.candidateName || "none"}
+
+User question:
+${question}
+  `.trim()
+},
     ],
     max_tokens: 10,
     temperature: 0,
@@ -83,7 +126,16 @@ Respond with ONLY the label: SQL, PDF, REPORT, or OUT_OF_SCOPE
 
   const intent = (resp.choices[0].message.content || "").trim().toUpperCase();
   const valid = ["SQL", "PDF", "REPORT", "OUT_OF_SCOPE"];
-  const result = valid.includes(intent) ? intent : "OUT_OF_SCOPE";
+ let result = valid.includes(intent) ? intent : "OUT_OF_SCOPE";
+
+if (result === "OUT_OF_SCOPE") {
+  if (
+    /interview|education|skill|experience|job|candidate/i.test(question)
+  ) {
+    log.info("[IntentFix] OOS overridden → SQL");
+    result = "SQL";
+  }
+}
   log.info(`Intent: ${result}`);
   return result;
 }
@@ -99,28 +151,13 @@ function detectResponseType(question, isSingleCandidate, totalFound, sectionsNee
   const compareWords = ["compare", "vs", "versus", "difference between", "contrast", "side by side"];
   if (compareWords.some((w) => q.includes(w))) return "COMPARE";
 
-  // ── NAME_LIST — user wants only names (may still have filters like gender) ─
-  //
-  // Two triggers:
-  //   1. LLM returned sectionsNeeded: ["root"]  — it understood "name only"
-  //   2. Question contains a name-list phrase like "full name", "name of X",
-  //      "list of candidates" — regardless of what sectionsNeeded says
-  //
-  // Filters (gender, city, verified…) are fine alongside NAME_LIST — they
-  // control WHICH candidates are shown, not WHAT data is shown per candidate.
-  //
-  // We deliberately do NOT gate on "no filters present" here.
-  // "name of female candidates"    → NAME_LIST  (gender filter is fine)
-  // "full name of verified people" → NAME_LIST  (isVerified filter is fine)
-  // "name of candidates from Surat"→ NAME_LIST  (city entity is fine)
 
   const isRootOnly =
     Array.isArray(sectionsNeeded) &&
     sectionsNeeded.length === 1 &&
     sectionsNeeded[0] === "root";
 
-  // Broader phrase list — covers "name of female candidate", "names of all",
-  // "give me names", "candidate names", "list of candidates" etc.
+
   const nameListPhrases = [
     "full name", "name of ", "names of", "give me name",
     "list of all candidate", "list all candidate", "all candidate name",
@@ -948,7 +985,7 @@ export async function generateNaturalAnswer(
   } = options;
 
   // 🧠 Detect type
-  const responseType = detectResponseType(
+  const responseType = options.responseType || detectResponseType(
     question,
     isSingleCandidate,
     totalFound,
@@ -984,7 +1021,8 @@ export async function generateNaturalAnswer(
   if (
     responseType === "NAME_LIST" ||
     responseType === "SKILLS_ONLY" ||
-    responseType === "FULL_DETAILS"
+    responseType === "FULL_DETAILS" ||
+    responseType === "MULTI_SECTION"
   ) {
     let body;
 
@@ -1004,6 +1042,39 @@ export async function generateNaturalAnswer(
 
     return body;
   }
+
+  // In generateNaturalAnswer, where you check options.responseType
+// if (options.responseType === "MULTI_SECTION") {
+//   return rows.map((c, i) => {
+//     const edu = (c.Education || [])[0];
+//     const skills = (c.Skills || []).map(s => s.Skill).filter(Boolean).join(", ");
+
+//     const lines = [`**${c.FullName}**`];
+
+//     if (skills) {
+//       lines.push(`- **Skills:** ${skills}`);
+//     } else {
+//       lines.push(`- **Skills:** Not listed`);
+//     }
+
+//     if (edu) {
+//       const ugPart = edu.UnderGraduationDegree
+//         ? `${edu.UnderGraduationDegree}${edu.underGraduationUniversityName ? ` from ${edu.underGraduationUniversityName}` : ""}${edu.underGraduationEndYear ? ` (${edu.underGraduationEndYear})` : ""}`
+//         : null;
+//       const pgPart = edu.PostGraduationDegree
+//         ? `${edu.PostGraduationDegree}${edu.postGraduationUniversityName ? ` from ${edu.postGraduationUniversityName}` : ""}${edu.postGraduationEndYear ? ` (${edu.postGraduationEndYear})` : ""}`
+//         : null;
+
+//       if (ugPart) lines.push(`- **UG:** ${ugPart}`);
+//       if (pgPart) lines.push(`- **PG:** ${pgPart}`);
+//       if (!ugPart && !pgPart) lines.push(`- **Education:** Not listed`);
+//     } else {
+//       lines.push(`- **Education:** Not listed`);
+//     }
+
+//     return lines.join("\n");
+//   }).join("\n\n");
+// }
 
   // ============================================================
   // 🤖 AI + FULL LIST MERGED
@@ -1066,4 +1137,111 @@ Write a natural explanation.
     const fallback = buildList(flatRows, totalFound);
     return `${fullList}\n\n${fallback}`;
   }
+}
+
+function buildMultiSection(rows, sectionsNeeded) {
+  const sec = new Set(Array.isArray(sectionsNeeded) ? sectionsNeeded : []);
+
+  return rows.map((c) => {
+    const lines = [`**${c.FullName}**`];
+
+    // ── Profile / born year / location ───────────────────────
+    if (sec.has("Profile")) {
+      const p = c.Profile || {};
+      if (p.dateOfBirth) {
+        const dob = new Date(p.dateOfBirth);
+        const born = isNaN(dob) ? p.dateOfBirth : 
+          dob.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+        lines.push(`- **Date of Birth:** ${born} (Born: ${isNaN(dob) ? "?" : dob.getFullYear()})`);
+      }
+      if (p.Gender)          lines.push(`- **Gender:** ${p.Gender}`);
+      if (p.city || p.state) lines.push(`- **Location:** ${[p.city, p.state].filter(Boolean).join(", ")}`);
+      if (p.languageKnown)   lines.push(`- **Languages:** ${p.languageKnown}`);
+      if (p.isStudying != null) lines.push(`- **Currently Studying:** ${p.isStudying ? "Yes" : "No"}`);
+      if (p.linkedinProfileUrl) lines.push(`- **LinkedIn:** ${p.linkedinProfileUrl}`);
+      if (p.portfolioGithubWebsiteUrl) lines.push(`- **Portfolio:** ${p.portfolioGithubWebsiteUrl}`);
+    }
+
+    // ── Skills ────────────────────────────────────────────────
+    if (sec.has("Skills")) {
+      const skills = (c.Skills || []).map(s => s.Skill).filter(Boolean).join(", ");
+      lines.push(`- **Skills:** ${skills || "Not listed"}`);
+    }
+
+    // ── Education ─────────────────────────────────────────────
+    if (sec.has("Education")) {
+      const edu = (c.Education || [])[0];
+      if (edu) {
+        const ugPart = edu.UnderGraduationDegree
+          ? `${edu.UnderGraduationDegree}${edu.underGraduationUniversityName ? ` from ${edu.underGraduationUniversityName}` : ""}${edu.underGraduationEndYear ? ` (${edu.underGraduationEndYear})` : ""}`
+          : null;
+        const pgPart = edu.PostGraduationDegree
+          ? `${edu.PostGraduationDegree}${edu.postGraduationUniversityName ? ` from ${edu.postGraduationUniversityName}` : ""}${edu.postGraduationEndYear ? ` (${edu.postGraduationEndYear})` : ""}`
+          : null;
+        if (ugPart) lines.push(`- **UG:** ${ugPart}`);
+        if (pgPart) lines.push(`- **PG:** ${pgPart}`);
+        if (!ugPart && !pgPart) lines.push(`- **Education:** Not listed`);
+      } else {
+        lines.push(`- **Education:** Not listed`);
+      }
+    }
+
+    // ── Experience ────────────────────────────────────────────
+    if (sec.has("Experience")) {
+      const exps = (c.Experience || [])
+        .filter(e => e.companyName?.trim())
+        .map(e => `${e.companyName} — ${e.role || "N/A"}${e.isCurrentCompany ? " (Current)" : ""}`)
+        .join("; ");
+      lines.push(`- **Experience:** ${exps || "Not listed"}`);
+    }
+
+    // ── Applications ──────────────────────────────────────────
+    if (sec.has("Applications") && !sec.has("Applications.Interviews")) {
+      const apps = (c.Applications || [])
+        .map(a => `${a.JobTitle || "?"}${a.Status ? ` (${a.Status})` : ""}${a.isShortlisted ? " ✓ Shortlisted" : ""}`)
+        .join("; ");
+      lines.push(`- **Applications:** ${apps || "None"}`);
+    }
+
+    // ── Interviews ────────────────────────────────────────────
+    if (sec.has("Applications.Interviews")) {
+      const interviews = (c.Applications || [])
+        .flatMap(a => (Array.isArray(a.Interviews) ? a.Interviews : [])
+          .map(iv => {
+            const parts = [`Job: ${a.JobTitle || "?"}`];
+            if (iv.InterviewStatus) parts.push(`Status: ${iv.InterviewStatus}`);
+            if (iv.Interviewer)     parts.push(`Interviewer: ${iv.Interviewer}`);
+            if (iv.isQualified != null) parts.push(`Qualified: ${iv.isQualified ? "Yes" : "No"}`);
+            if (iv.marksObtained != null) parts.push(`Marks: ${iv.marksObtained}${iv.totalMarks ? `/${iv.totalMarks}` : ""}`);
+            if (iv.feedback?.trim()) parts.push(`Feedback: "${iv.feedback.trim()}"`);
+            return parts.join(" | ");
+          })
+        );
+      lines.push(`- **Interviews:** ${interviews.join("\n  ") || "None"}`);
+    }
+
+    // ── Documents ─────────────────────────────────────────────
+    if (sec.has("Documents")) {
+      const doc = c.Documents || {};
+      const uploaded = [
+        doc.adharPath        ? "Aadhar"           : null,
+        doc.pancardPath      ? "PAN Card"          : null,
+        doc.bankpassbook     ? "Bank Passbook"     : null,
+        doc.bankStatement    ? "Bank Statement"    : null,
+        doc.salarySlip       ? "Salary Slip"       : null,
+        doc.expierenceLetter ? "Experience Letter" : null,
+        doc.offerLetter      ? "Offer Letter"      : null,
+        doc.itr              ? "ITR"               : null,
+      ].filter(Boolean);
+      lines.push(`- **Documents:** ${uploaded.length ? uploaded.join(", ") : "None uploaded"}`);
+    }
+
+    // ── Resumes ───────────────────────────────────────────────
+    if (sec.has("Resumes")) {
+      const resumes = (c.Resumes || []).filter(r => r.resume?.trim());
+      lines.push(`- **Resumes:** ${resumes.length ? `${resumes.length} uploaded` : "None uploaded"}`);
+    }
+
+    return lines.join("\n");
+  }).join("\n\n");
 }

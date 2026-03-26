@@ -33,8 +33,78 @@ let candidateIndex = null;
 
 const analysisCache = new Map();
 
+let lastTopic = null;
+let lastResolvedContext = {};
 
-let lastResolvedContext = {};      
+let contextMemory = {
+  candidateName: null,
+  lastIntent: null,
+  lastTopic: null,
+  lastSections: null,
+  mode: null 
+};
+
+let conversationMemory = [];
+const MAX_HISTORY = 10;     
+
+function addToMemory(role, content) {
+  if (!content) return;
+
+  conversationMemory.push({ role, content });
+
+  if (conversationMemory.length > MAX_HISTORY) {
+    conversationMemory.shift();
+  }
+}
+
+function buildConversationContext() {
+  return conversationMemory
+    .map(m => `${m.role}: ${m.content}`)
+    .join("\n");
+}
+
+function detectTopics(question) {
+  const q = question.toLowerCase();
+  const topics = [];
+
+  if (q.includes("skill") || q.includes("technology") || q.includes("tech stack")) 
+    topics.push("SKILLS");
+  
+  if (q.includes("education") || q.includes("degree") || q.includes("university") || 
+      q.includes("college") || q.includes("qualification")) 
+    topics.push("EDUCATION");
+  
+  if (q.includes("experience") || q.includes("company") || q.includes("worked") || 
+      q.includes("working")) 
+    topics.push("EXPERIENCE");
+  
+  if (q.includes("interview") || q.includes("marks") || q.includes("score") || 
+      q.includes("feedback") || q.includes("qualified")) 
+    topics.push("INTERVIEW");
+  
+  if (q.includes("job") || q.includes("application") || q.includes("applied") || 
+      q.includes("shortlist") || q.includes("accepted")) 
+    topics.push("JOB");
+  
+  // ← NEW: Profile section triggers
+  if (q.includes("born") || q.includes("birth") || q.includes("dob") || 
+      q.includes("age") || q.includes("gender") || q.includes("city") || 
+      q.includes("location") || q.includes("state") || q.includes("language") || 
+      q.includes("linkedin") || q.includes("portfolio") || q.includes("studying")) 
+    topics.push("PROFILE");
+
+  // ← NEW: Documents
+  if (q.includes("document") || q.includes("aadhar") || q.includes("pan") || 
+      q.includes("resume") || q.includes("salary slip") || q.includes("offer letter") || 
+      q.includes("itr") || q.includes("bank")) 
+    topics.push("DOCUMENTS");
+
+  // ← NEW: Resume specifically
+  if (q.includes("resume") || q.includes("cv")) 
+    topics.push("RESUMES");
+
+  return topics;
+}
 
 //  PUBLIC API
 
@@ -73,8 +143,11 @@ async function _doWarmUp() {
 
 
 export async function answerFromCache(question, options = {}) {
+
+  const analysis = await analyzeQuestion(question, candidateStore.candidates);
+
  
-  
+  addToMemory("user", question);
   const onChunk = typeof options === "function"
     ? options
     : (options?.onChunk ?? null);
@@ -108,9 +181,79 @@ export async function answerFromCache(question, options = {}) {
   }
 
   
-  const analysis = await analyzeQuestion(question, candidateStore.candidates);
+  // const analysis = await analyzeQuestion(question, candidateStore.candidates);
+  // ── STEP: Reset context if this is a new independent query ──────────────
+const hasExplicitFilters = Object.values(analysis.filters || {}).some(v => v != null);
 
-  
+const isListQuery =
+  analysis.entities?.skill ||
+  analysis.entities?.city ||
+  analysis.entities?.state ||
+  analysis.entities?.jobTitle ||
+  analysis.entities?.companyName;
+
+if (isListQuery || hasExplicitFilters) {
+  // Switching to a list/filter query — wipe any leftover single-candidate context
+  contextMemory.mode = "LIST";
+  contextMemory.candidateName = null;
+  lastTopic = null; // ← KEY FIX: prevents lastTopic bleeding into list queries
+   conversationMemory = []; 
+  log.info("[ContextReset] List/filter query detected — candidate context cleared");
+}
+
+  if (
+  contextMemory.mode === "SINGLE" &&
+  contextMemory.candidateName &&
+  !analysis.entities?.candidateName && 
+   !isListQuery &&        // ← ADD THIS
+  !hasExplicitFilters 
+) {
+  analysis.entities.candidateName = contextMemory.candidateName;
+
+  log.info(`[ContextAI] Applied SINGLE context EARLY: ${contextMemory.candidateName}`);
+}
+
+  const topics = detectTopics(question);
+
+if (topics.length > 0 && !analysis.entities?.candidateName) {
+  lastTopic = topics;
+  log.info(`[Context] Topic set: ${topics}`);
+}
+  // HANDLE CLARIFICATION
+if (analysis.askClarification) {
+  const msg = analysis.clarificationMessage;
+
+  if (onChunk) await onChunk(msg);
+
+  return {
+    success: true,
+    answer: onChunk ? null : msg,
+    dataframe: [],
+  };
+}
+
+  // 🔥 Update context memory
+const detectedTopics = detectTopics(question);
+if (detectedTopics.length > 0) {
+  contextMemory.lastTopic = detectedTopics;
+}
+const hasOnlyCandidate =
+  analysis.entities?.candidateName &&
+  Object.keys(analysis.entities).filter(k => analysis.entities[k]).length === 1;
+
+if (hasOnlyCandidate) {
+  contextMemory.mode = "SINGLE";
+  contextMemory.candidateName = analysis.entities.candidateName;
+} else {
+  contextMemory.mode = "LIST";
+}
+
+if (detectedTopics) {
+  contextMemory.lastTopic = detectedTopics;
+}
+
+contextMemory.lastIntent = analysis.intent;
+contextMemory.lastSections = analysis.sectionsNeeded;
 
   if (!analysis.entities.candidateName && lastResolvedContext.candidateName) {
     const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
@@ -119,11 +262,56 @@ export async function answerFromCache(question, options = {}) {
       log.info(`[ContextInherit] Carried forward candidateName: "${lastResolvedContext.candidateName}"`);
     }
   }
+  // 🔥 New context memory fallback
+if (
+  contextMemory.mode === "SINGLE" &&
+  contextMemory.candidateName &&
+  !analysis.entities.candidateName && 
+   !isListQuery &&        
+  !hasExplicitFilters 
+) {
+  analysis.entities.candidateName = contextMemory.candidateName;
+
+  log.info(`[ContextAI] Applied SINGLE context: ${contextMemory.candidateName}`);
+}
 
   
   fixMisclassifiedIntent(analysis, question);
 
   log.info(`[Step 1] Analysis: ${JSON.stringify(analysis)}`);
+let finalSections = analysis.sectionsNeeded;
+
+// 🔥 APPLY LAST TOPIC (CRITICAL FIX)
+const isStandaloneNameQuery =
+  analysis.entities?.candidateName &&
+  Object.keys(analysis.entities).filter(k => analysis.entities[k]).length === 1 &&
+  question.trim().split(/\s+/).length <= 3;
+
+
+const currentTopics = detectTopics(question);
+if (currentTopics.length === 0 && lastTopic && analysis.entities?.candidateName && !isStandaloneNameQuery) {
+  const mergedSections = new Set(["root"]);
+  const topicsToApply = Array.isArray(lastTopic) ? lastTopic : [lastTopic];
+  
+ for (const t of currentTopics) {  // or topicsToApply
+  if (t === "SKILLS")     mergedSections.add("Skills");
+  if (t === "EDUCATION")  mergedSections.add("Education");
+  if (t === "EXPERIENCE") mergedSections.add("Experience");
+  if (t === "INTERVIEW")  { 
+    mergedSections.add("Applications"); 
+    mergedSections.add("Applications.Interviews"); 
+  }
+  if (t === "JOB")        mergedSections.add("Applications");
+  if (t === "PROFILE")    mergedSections.add("Profile");    // ← NEW
+  if (t === "DOCUMENTS")  mergedSections.add("Documents");  // ← NEW
+  if (t === "RESUMES")    mergedSections.add("Resumes");    // ← NEW
+}
+  finalSections = [...mergedSections];
+  log.info(`[ContextFix] Applying last topics: ${topicsToApply.join(",")} → ${finalSections}`);
+  lastTopic = null;
+} else if (isStandaloneNameQuery) {
+  lastTopic = null;
+}
 
   
   if (["PDF", "REPORT", "OOS"].includes(analysis.intent)) {
@@ -135,6 +323,50 @@ export async function answerFromCache(question, options = {}) {
       dataframe: null,
     };
   }
+
+  const vaguePatterns = [
+  "interview date",
+  "job details",
+  "education",
+  "skills",
+  "experience",
+  "interview status"
+];
+
+const isVagueQuery = vaguePatterns.some(p =>
+  question.toLowerCase().includes(p)
+);
+
+if (isVagueQuery && !analysis.entities.candidateName) {
+  if (contextMemory.candidateName) {
+    analysis.entities.candidateName = contextMemory.candidateName;
+
+    log.info(`[ContextResolve] Filled missing candidate`);
+  } else {
+    return {
+      success: true,
+      answer: "Please specify the candidate name.",
+      dataframe: []
+    };
+  }
+}
+// 🔥 APPLY PREVIOUS TOPIC
+if (currentTopics.length > 0) {
+  const mergedSections = new Set(
+    Array.isArray(finalSections) ? finalSections : ["root"]
+  );
+  
+  for (const t of currentTopics) {
+    if (t === "SKILLS")    mergedSections.add("Skills");
+    if (t === "INTERVIEW") { mergedSections.add("Applications"); mergedSections.add("Applications.Interviews"); }
+    if (t === "EDUCATION") mergedSections.add("Education");
+    if (t === "EXPERIENCE") mergedSections.add("Experience");
+    if (t === "JOB")       mergedSections.add("Applications");
+  }
+  finalSections = [...mergedSections];
+  log.info(`[Fix] Merged sections for topics [${currentTopics.join(",")}]: ${finalSections}`);
+  lastTopic = null;
+}
 
   // interviewRound not in SP
   if (analysis.filters?.interviewRound) {
@@ -156,6 +388,7 @@ export async function answerFromCache(question, options = {}) {
       answer: onChunk ? null : msg,
     };
   }
+
 
   // COUNT intent
   if (analysis.intent === "COUNT") {
@@ -259,12 +492,12 @@ export async function answerFromCache(question, options = {}) {
     analysis.entities.candidateName.trim() !== ""
   );
 
-  const llmSections = analysis.sectionsNeeded;
+  
   const sections = isSingleCandidate
-    ? (llmSections === "ALL" || !Array.isArray(llmSections)
+    ? (finalSections === "ALL" || !Array.isArray(finalSections)
         ? ALL_SECTIONS
-        : llmSections)
-    : getSummarySections(analysis.filters || {}, llmSections);
+        : finalSections)
+    : getSummarySections(analysis.filters || {}, finalSections);
 
   const userLimit =
     analysis.limit != null &&
@@ -291,7 +524,51 @@ export async function answerFromCache(question, options = {}) {
   }
 
   // Step 4: answer
-  const responseType = detectResponseType(question);
+ let responseType = detectResponseType(question);
+
+// Determine which sections are actually present
+const hasSkills    = sections.includes("Skills");
+const hasEducation = sections.includes("Education");
+const hasInterview = sections.includes("Applications.Interviews");
+const hasProfile   = sections.includes("Profile");
+const hasExp       = sections.includes("Experience");
+const hasDocuments = sections.includes("Documents");
+const hasResumes   = sections.includes("Resumes");
+const hasApps      = sections.includes("Applications");
+
+const contentSections = [
+  hasSkills, hasEducation, hasInterview, hasProfile, 
+  hasExp, hasDocuments, hasResumes, hasApps
+].filter(Boolean).length;
+// Multi-section: don't override, let generateNaturalAnswer handle all sections
+if (contentSections >= 2) {
+  // Multiple sections — always use MULTI_SECTION
+  responseType = "MULTI_SECTION";
+} else if (hasSkills) {
+  responseType = "WITH_SKILLS";
+} else if (hasInterview) {
+  responseType = "WITH_INTERVIEW";
+} else if (hasEducation) {
+  responseType = "WITH_EDUCATION";
+} else if (hasProfile) {
+  responseType = "WITH_PROFILE";
+} else if (hasExp) {
+  responseType = "WITH_EXPERIENCE";
+} else if (hasDocuments) {
+  responseType = "WITH_DOCUMENTS";
+} else if (hasResumes) {
+  responseType = "WITH_RESUMES";
+} else if (hasApps) {
+  responseType = "WITH_APPLICATIONS";
+}
+
+// NAME_LIST override — always wins
+if (detectNameOnlyRequest(question)) {
+  responseType = "NAME_LIST";
+  log.info("[ResponseType] NAME_LIST — user asked for names only");
+}
+
+log.info(`[ResponseType] ${responseType}`);
   const answer = await generateNaturalAnswer(
     question,
     `${SP_NAME} (cached at ${candidateStore.cachedAt.toLocaleString()})`,
@@ -305,6 +582,10 @@ export async function answerFromCache(question, options = {}) {
     },
     onChunk,
   );
+//   if (analysis.entities?.candidateName) {
+//   lastTopic = null; // reset after applying
+// }
+  addToMemory("assistant", answer);
 
   return {
     success: true,
@@ -360,6 +641,8 @@ export function clearCache() {
 
 export function resetConversationContext() {
   lastResolvedContext = {};
+  contextMemory = {};
+  conversationMemory = [];
   log.info("Conversation context reset");
 }
 
@@ -410,6 +693,22 @@ function detectGreeting(question) {
   return greetings.some(g => q === g || q.includes(g));
 }
 
+function detectNameOnlyRequest(question) {
+  const q = question.toLowerCase().trim();
+  const nameOnlyPatterns = [
+    /only\s+name/,
+    /names?\s+only/,
+    /just\s+(the\s+)?names?/,
+    /give\s+(me\s+)?(only\s+)?names?/,
+    /list\s+(of\s+)?names?/,
+    /names?\s+of\s+(all\s+)?candidates?/,
+    /candidate\s+names?/,
+    /show\s+(me\s+)?(only\s+)?names?/,
+    /sirf\s+naam/,
+    /naam\s+(do|batao|dikhao)/,
+  ];
+  return nameOnlyPatterns.some(p => p.test(q));
+}
 
 function getGreetingResponse() {
   const responses = [
@@ -421,6 +720,7 @@ function getGreetingResponse() {
 
   return responses[Math.floor(Math.random() * responses.length)];
 }
+
 function detectSmallTalk(q) {
   const text = q.toLowerCase();
 
@@ -779,7 +1079,7 @@ function fixMisclassifiedIntent(analysis, question) {
 
 async function analyzeQuestion(question, candidates) {
  
-  const cacheKey = question.toLowerCase().trim();
+  const cacheKey = `${question.toLowerCase().trim()}::${conversationMemory.length}`;
   const cached = analysisCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ANALYSIS_CACHE_TTL) {
     log.info(`[AnalysisCache] HIT for: "${cacheKey.slice(0, 60)}"`);
@@ -917,6 +1217,14 @@ CRITICAL: If the question starts with or contains a number followed by
 that implies a list → intent is CANDIDATE, put that number in "limit".
 Never set intent to COUNT just because a number appears in the question.
 
+CRITICAL — pronoun-only queries like "his skills", "her education", "their experience"
+are ALWAYS intent: CANDIDATE with the relevant section.
+These are NEVER OOS — they are follow-up questions about the previously mentioned candidate.
+  "his skills"      → intent: CANDIDATE, sectionsNeeded: ["root","Skills"]
+  "her education"   → intent: CANDIDATE, sectionsNeeded: ["root","Education"]  
+  "his experience"  → intent: CANDIDATE, sectionsNeeded: ["root","Experience"]
+  "their interview" → intent: CANDIDATE, sectionsNeeded: ["root","Applications","Applications.Interviews"]
+
 PDF    — questions about POLICIES, PROCESSES, GUIDELINES, or HR concepts.
          These do NOT ask for specific data records.
          Examples:
@@ -949,6 +1257,9 @@ LIMIT RULES:
 
 ────────────────────────────────────────
 ENTITY RULES:
+- CRITICAL — never carry forward entities from conversation history into the current question.
+- If the user says "skills" alone, skill: null — do NOT assume they mean a previously mentioned skill.
+- Only extract entities explicitly stated in the CURRENT question.
 - candidateName: match ANY name resembling one in the list (partial/lowercase/typo OK)
 - Extract city, state, skill, jobTitle, companyName when clearly mentioned
 - universityName: extract when user mentions a college, university, or institute name
@@ -1119,8 +1430,11 @@ When a filter is present with no candidate name → use sections matching that f
 Always include "root" in every specific array.
 When unsure → "ALL"
 
-User question: "${question.replace(/"/g, '\\"')}"
-JSON:`.trim();
+Recent conversation (for pronoun/follow-up resolution ONLY — do NOT inherit entities like skill/city/jobTitle from previous turns):
+${buildConversationContext()}
+
+Current user question:
+"${question.replace(/"/g, '\\"')}"JSON:`.trim();
 
   // LLM call with single retry on JSON parse failure 
   let lastError = null;
@@ -1138,7 +1452,32 @@ JSON:`.trim();
         .replace(/\n?```$/, "");
 
       const parsed = JSON.parse(raw);
+// 🔥 FIX: prevent wrong OOS for data-related queries
+if (parsed.intent === "OOS") {
+  const q = question.toLowerCase();
 
+  const dataKeywords = [
+    "interview",
+    "interview date",
+    "interview status",
+    "education",
+    "skills",
+    "experience",
+    "job",
+    "application",
+    "marks",
+    "candidate"
+  ];
+
+  const isDataQuery = dataKeywords.some(k => q.includes(k));
+
+  if (isDataQuery) {
+    log.info("[IntentFix] OOS → CANDIDATE (data keyword detected)");
+
+    parsed.intent = "CANDIDATE";
+    parsed.sectionsNeeded = ["root", "Applications", "Applications.Interviews"];
+  }
+}
       // Schema validation
       if (!validateAnalysis(parsed)) {
         throw new Error(`Invalid analysis schema: ${JSON.stringify(parsed).slice(0, 100)}`);
@@ -1209,6 +1548,38 @@ JSON:`.trim();
         filters: normFilters,
         sectionsNeeded: parsed.sectionsNeeded || "ALL",
       };
+const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
+
+if (pronounPattern.test(question) && contextMemory.candidateName) {
+  const expanded = `${contextMemory.candidateName} ${question
+    .replace(/\b(his|her|their)\b/gi, "")
+    .replace(/\b(he|she|they|them|this person|the candidate|this candidate)\b/gi, "")
+    .trim()}`;
+  
+  log.info(`[PronounExpand] "${question}" → "${expanded}"`);
+  question = expanded;
+}
+      // STEP 3 — HANDLE “WHOSE?” (ADD HERE)
+if (
+  result.intent === "CANDIDATE" &&
+  !result.entities?.candidateName &&
+  !contextMemory?.candidateName
+) {
+  const isListQuery =
+    result.entities?.skill ||
+    result.entities?.city ||
+    result.entities?.state ||
+    result.entities?.jobTitle ||
+    Object.values(result.filters || {}).some(v => v != null);
+
+  const isVagueFollowUp =
+    question.trim().split(/\s+/).length <= 2 && // very short: "education", "skills"
+    /^(interview|education|skills?|experience|job)$/i.test(question.trim());
+
+  if (isVagueFollowUp && !isListQuery) {
+    return { intent: "CANDIDATE", askClarification: true, clarificationMessage: "Please specify the candidate name." };
+  }
+}
 
       // ── Store in LRU cache ────────────────────────────────────────────────
       analysisCache.set(cacheKey, { result, ts: Date.now() });
@@ -1836,7 +2207,7 @@ function getSummarySections(filters, llmSectionsNeeded) {
   }
 
 
-  const sections = new Set(["root", "Profile", "Skills"]);
+  const sections = new Set(["root", "Profile"]);
 
   if (filters.birthYear != null || filters.birthYearFrom != null || filters.birthYearTo != null) {
     sections.add("Profile");
@@ -1861,6 +2232,16 @@ function getSummarySections(filters, llmSectionsNeeded) {
     sections.add("Applications");
     sections.add("Applications.Interviews");
   }
+
+  // ADD THIS inside getSummarySections, before the final return
+if (
+  filters.hasResume != null ||
+  filters.resumeCount != null
+) {
+  sections.add("Resumes");
+  // Remove Skills if it was added — resume queries don't need it
+  sections.delete("Skills");
+}
 
  
   const allowed = new Set([
