@@ -10,8 +10,8 @@
 //  5. writableEnded guard prevents "write after end" crash
 // ============================================================
 
-import { chatbot, resetConversation } from "../services/chatbot.service.js";
-import { forceRefresh, getCacheStatus } from "../services/candidate.cache.js";
+import { chatbot, resetConversation} from "../services/chatbot.service.js";
+import { forceRefresh, getCacheStatus  } from "../services/candidate.cache.js";
 import { log } from "../utils/logger.js";
 
 const STREAM_TIMEOUT_MS = 30_000; // 30 seconds
@@ -28,7 +28,9 @@ const STREAM_TIMEOUT_MS = 30_000; // 30 seconds
 //   Returns full JSON: { success, type, answer, dataframe }
 // ─────────────────────────────────────────────────────────────────────────────
 export async function handleChat(req, res) {
-  const { question, stream: streamParam } = req.body;
+const { question, stream: streamParam } = req.body;
+const resolvedSessionId = req.resolvedSessionId || "default";
+
 
   if (!question || typeof question !== "string" || !question.trim()) {
     return res.status(400).json({ error: "Question is required." });
@@ -76,7 +78,7 @@ export async function handleChat(req, res) {
     }, STREAM_TIMEOUT_MS);
 
     try {
-      const result = await chatbot(question.trim(), onChunk);
+      const result = await chatbot(question.trim(), onChunk, resolvedSessionId);
 
       // Clear timeout — we got a response in time
       clearTimeout(timeoutHandle);
@@ -88,6 +90,7 @@ export async function handleChat(req, res) {
       if (result.answer) {
         sendEvent({ type: "token", text: result.answer });
       }
+      log.info(`[Session] resolvedSessionId: "${resolvedSessionId}"`);
 
       sendEvent({
         type: "done",
@@ -118,7 +121,7 @@ export async function handleChat(req, res) {
 
   // ── NON-STREAMING (legacy) ────────────────────────────────────────────────
   try {
-    const result = await chatbot(question.trim(), null);
+   const result = await chatbot(question.trim(), null, resolvedSessionId);
     return res.json({
       success: true,
       type: result.type,
@@ -138,8 +141,9 @@ export async function handleChat(req, res) {
 // POST /api/reset
 // ─────────────────────────────────────────────────────────────────────────────
 export function handleReset(req, res) {
+const resolvedSessionId = req.resolvedSessionId || "default";
   try {
-    resetConversation();
+    resetConversation(resolvedSessionId);
     return res.json({ success: true, message: "Conversation reset." });
   } catch (err) {
     log.error(`Reset error: ${err.message}`);

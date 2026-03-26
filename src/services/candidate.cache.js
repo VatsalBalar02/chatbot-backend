@@ -33,32 +33,52 @@ let candidateIndex = null;
 
 const analysisCache = new Map();
 
-let lastTopic = null;
-let lastResolvedContext = {};
+const sessions = new Map();
+const MAX_HISTORY = 10;
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
+const PRONOUN_RE = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
+// Prevent memory leak — clean up sessions idle for over 1 hour
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions.entries()) {
+    if (now - session.lastActive > SESSION_TTL_MS) {
+      sessions.delete(id);
+      log.info(`[SessionCleanup] Expired session: ${id}`);
+    }
+  }
+}, 15 * 60 * 1000); // runs every 15 minutes
 
-let contextMemory = {
-  candidateName: null,
-  lastIntent: null,
-  lastTopic: null,
-  lastSections: null,
-  mode: null 
-};
+function getSession(sessionId) {
+  if (!sessions.get(sessionId)) {
+    sessions.set(sessionId, {
+      lastTopic: null,
+      lastResolvedContext: {},
+      contextMemory: {
+        candidateName: null,
+        lastIntent: null,
+        lastTopic: null,
+        lastSections: null,
+        mode: null,
+      },
+      conversationMemory: [],
+      lastActive: Date.now(),
+    });
+  }
+  const session = sessions.get(sessionId);
+  session.lastActive = Date.now(); // refresh on every access
+  return session;
+}  
 
-let conversationMemory = [];
-const MAX_HISTORY = 10;     
-
-function addToMemory(role, content) {
+function addToMemory(session, role, content) {
   if (!content) return;
-
-  conversationMemory.push({ role, content });
-
-  if (conversationMemory.length > MAX_HISTORY) {
-    conversationMemory.shift();
+  session.conversationMemory.push({ role, content });
+  if (session.conversationMemory.length > MAX_HISTORY) {
+    session.conversationMemory.shift();
   }
 }
 
-function buildConversationContext() {
-  return conversationMemory
+function buildConversationContext(session) {
+  return session.conversationMemory
     .map(m => `${m.role}: ${m.content}`)
     .join("\n");
 }
@@ -143,11 +163,15 @@ async function _doWarmUp() {
 
 
 export async function answerFromCache(question, options = {}) {
+  const sessionId = options?.sessionId ?? "default";
+  const session = getSession(sessionId);
 
-  const analysis = await analyzeQuestion(question, candidateStore.candidates);
+  // const { lastTopic, lastResolvedContext, contextMemory, conversationMemory } = session;
 
- 
-  addToMemory("user", question);
+  // const analysis = await analyzeQuestion(question, candidateStore.candidates, session);
+
+
+  addToMemory(session, "user", question);
   const onChunk = typeof options === "function"
     ? options
     : (options?.onChunk ?? null);
@@ -172,51 +196,65 @@ export async function answerFromCache(question, options = {}) {
   }
   
    if (detectGreeting(question)) {
-    return getGreetingResponse();
-  }
+  return {
+    success: true,
+    answer: getGreetingResponse(),
+    dataframe: [],
+  };
+}
 
-  const smallTalk = detectSmallTalk?.(question);
-  if (smallTalk) {
-    return smallTalk;
-  }
-
+const smallTalk = detectSmallTalk?.(question);
+if (smallTalk) {
+  return {
+    success: true,
+    answer: smallTalk,
+    dataframe: [],
+  };
+} 
+  const analysis = await analyzeQuestion(question, candidateStore.candidates, session);
   
-  // const analysis = await analyzeQuestion(question, candidateStore.candidates);
+  
+
   // ── STEP: Reset context if this is a new independent query ──────────────
-const hasExplicitFilters = Object.values(analysis.filters || {}).some(v => v != null);
+const hasExplicitFilters = 
+  Object.values(analysis.filters || {}).some(v => v != null) ||
+  !!(analysis.entities?.email) ||
+  !!(analysis.entities?.phoneNumber);
 
 const isListQuery =
   analysis.entities?.skill ||
   analysis.entities?.city ||
   analysis.entities?.state ||
   analysis.entities?.jobTitle ||
-  analysis.entities?.companyName;
+  analysis.entities?.companyName ||
+  analysis.entities?.email ||
+  analysis.entities?.phoneNumber ||
+  analysis.entities?.universityName;
 
 if (isListQuery || hasExplicitFilters) {
-  // Switching to a list/filter query — wipe any leftover single-candidate context
-  contextMemory.mode = "LIST";
-  contextMemory.candidateName = null;
-  lastTopic = null; // ← KEY FIX: prevents lastTopic bleeding into list queries
-   conversationMemory = []; 
+  session.contextMemory.mode = "LIST";
+  session.contextMemory.candidateName = null;
+  session.lastTopic = null;
+  session.conversationMemory = [];
   log.info("[ContextReset] List/filter query detected — candidate context cleared");
 }
 
-  if (
-  contextMemory.mode === "SINGLE" &&
-  contextMemory.candidateName &&
-  !analysis.entities?.candidateName && 
-   !isListQuery &&        // ← ADD THIS
-  !hasExplicitFilters 
+if (
+  analysis.intent !== "COUNT" &&
+  session.contextMemory.mode === "SINGLE" &&
+  session.contextMemory.candidateName &&
+  !analysis.entities?.candidateName &&
+  !isListQuery &&
+  !hasExplicitFilters
 ) {
-  analysis.entities.candidateName = contextMemory.candidateName;
-
-  log.info(`[ContextAI] Applied SINGLE context EARLY: ${contextMemory.candidateName}`);
+  analysis.entities.candidateName = session.contextMemory.candidateName;
+  log.info(`[ContextAI] Applied SINGLE context EARLY: ${session.contextMemory.candidateName}`);
 }
 
-  const topics = detectTopics(question);
+const topics = detectTopics(question);
 
 if (topics.length > 0 && !analysis.entities?.candidateName) {
-  lastTopic = topics;
+  session.lastTopic = topics;
   log.info(`[Context] Topic set: ${topics}`);
 }
   // HANDLE CLARIFICATION
@@ -235,44 +273,40 @@ if (analysis.askClarification) {
   // 🔥 Update context memory
 const detectedTopics = detectTopics(question);
 if (detectedTopics.length > 0) {
-  contextMemory.lastTopic = detectedTopics;
+  session.contextMemory.lastTopic = detectedTopics;
 }
 const hasOnlyCandidate =
   analysis.entities?.candidateName &&
   Object.keys(analysis.entities).filter(k => analysis.entities[k]).length === 1;
 
 if (hasOnlyCandidate) {
-  contextMemory.mode = "SINGLE";
-  contextMemory.candidateName = analysis.entities.candidateName;
+  session.contextMemory.mode = "SINGLE";
+  session.contextMemory.candidateName = analysis.entities.candidateName;
 } else {
-  contextMemory.mode = "LIST";
+  session.contextMemory.mode = "LIST";
 }
 
-if (detectedTopics) {
-  contextMemory.lastTopic = detectedTopics;
-}
+session.contextMemory.lastIntent = analysis.intent;
+session.contextMemory.lastSections = analysis.sectionsNeeded;
 
-contextMemory.lastIntent = analysis.intent;
-contextMemory.lastSections = analysis.sectionsNeeded;
-
-  if (!analysis.entities.candidateName && lastResolvedContext.candidateName) {
-    const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
-    if (pronounPattern.test(question)) {
-      analysis.entities.candidateName = lastResolvedContext.candidateName;
-      log.info(`[ContextInherit] Carried forward candidateName: "${lastResolvedContext.candidateName}"`);
-    }
-  }
+//   if (!analysis.entities.candidateName && session.lastResolvedContext.candidateName) {
+//   const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
+//   if (pronounPattern.test(question)) {
+//     analysis.entities.candidateName = session.lastResolvedContext.candidateName;
+//     log.info(`[ContextInherit] Carried forward candidateName: "${session.lastResolvedContext.candidateName}"`);
+//   }
+// }
   // 🔥 New context memory fallback
 if (
-  contextMemory.mode === "SINGLE" &&
-  contextMemory.candidateName &&
-  !analysis.entities.candidateName && 
-   !isListQuery &&        
-  !hasExplicitFilters 
+  analysis.intent !== "COUNT" &&
+  session.contextMemory.mode === "SINGLE" &&
+  session.contextMemory.candidateName &&
+  !analysis.entities.candidateName &&
+  !isListQuery &&
+  !hasExplicitFilters
 ) {
-  analysis.entities.candidateName = contextMemory.candidateName;
-
-  log.info(`[ContextAI] Applied SINGLE context: ${contextMemory.candidateName}`);
+  analysis.entities.candidateName = session.contextMemory.candidateName;
+  log.info(`[ContextAI] Applied SINGLE context: ${session.contextMemory.candidateName}`);
 }
 
   
@@ -287,11 +321,10 @@ const isStandaloneNameQuery =
   Object.keys(analysis.entities).filter(k => analysis.entities[k]).length === 1 &&
   question.trim().split(/\s+/).length <= 3;
 
-
 const currentTopics = detectTopics(question);
-if (currentTopics.length === 0 && lastTopic && analysis.entities?.candidateName && !isStandaloneNameQuery) {
+if (currentTopics.length === 0 && session.lastTopic && analysis.entities?.candidateName && !isStandaloneNameQuery) {
   const mergedSections = new Set(["root"]);
-  const topicsToApply = Array.isArray(lastTopic) ? lastTopic : [lastTopic];
+  const topicsToApply = Array.isArray(session.lastTopic) ? session.lastTopic : [session.lastTopic];
   
  for (const t of currentTopics) {  // or topicsToApply
   if (t === "SKILLS")     mergedSections.add("Skills");
@@ -306,11 +339,11 @@ if (currentTopics.length === 0 && lastTopic && analysis.entities?.candidateName 
   if (t === "DOCUMENTS")  mergedSections.add("Documents");  // ← NEW
   if (t === "RESUMES")    mergedSections.add("Resumes");    // ← NEW
 }
-  finalSections = [...mergedSections];
+   finalSections = [...mergedSections];
   log.info(`[ContextFix] Applying last topics: ${topicsToApply.join(",")} → ${finalSections}`);
-  lastTopic = null;
+  session.lastTopic = null;
 } else if (isStandaloneNameQuery) {
-  lastTopic = null;
+  session.lastTopic = null;
 }
 
   
@@ -338,9 +371,8 @@ const isVagueQuery = vaguePatterns.some(p =>
 );
 
 if (isVagueQuery && !analysis.entities.candidateName) {
-  if (contextMemory.candidateName) {
-    analysis.entities.candidateName = contextMemory.candidateName;
-
+    if (session.contextMemory.candidateName) {
+    analysis.entities.candidateName = session.contextMemory.candidateName;
     log.info(`[ContextResolve] Filled missing candidate`);
   } else {
     return {
@@ -364,8 +396,8 @@ if (currentTopics.length > 0) {
     if (t === "JOB")       mergedSections.add("Applications");
   }
   finalSections = [...mergedSections];
-  log.info(`[Fix] Merged sections for topics [${currentTopics.join(",")}]: ${finalSections}`);
-  lastTopic = null;
+ log.info(`[Fix] Merged sections for topics [${currentTopics.join(",")}]: ${finalSections}`);
+  session.lastTopic = null;
 }
 
   // interviewRound not in SP
@@ -512,21 +544,10 @@ if (currentTopics.length > 0) {
 
   const slicedForLLM = sortedFiltered.slice(0, effectiveCap);
   const projected = projectData(slicedForLLM, sections);
-  log.info(
-    `[Step 3] isSingleCandidate: ${isSingleCandidate} | Sections: ${JSON.stringify(sections)} — userLimit: ${userLimit ?? "none"} — sending ${projected.length} of ${filtered.length} candidates to LLM`,
-  );
+  // 🔥 RESPONSE TYPE (CORRECT PLACE)
+const isSingleCandidateFinal = projected.length === 1;
+const totalFoundFinal = filtered.length;
 
-  if (analysis.entities?.candidateName) {
-    lastResolvedContext = {
-      candidateName: analysis.entities.candidateName,
-      jobTitle: analysis.entities.jobTitle ?? lastResolvedContext.jobTitle,
-    };
-  }
-
-  // Step 4: answer
- let responseType = detectResponseType(question);
-
-// Determine which sections are actually present
 const hasSkills    = sections.includes("Skills");
 const hasEducation = sections.includes("Education");
 const hasInterview = sections.includes("Applications.Interviews");
@@ -540,35 +561,194 @@ const contentSections = [
   hasSkills, hasEducation, hasInterview, hasProfile, 
   hasExp, hasDocuments, hasResumes, hasApps
 ].filter(Boolean).length;
-// Multi-section: don't override, let generateNaturalAnswer handle all sections
-if (contentSections >= 2) {
-  // Multiple sections — always use MULTI_SECTION
-  responseType = "MULTI_SECTION";
-} else if (hasSkills) {
-  responseType = "WITH_SKILLS";
-} else if (hasInterview) {
-  responseType = "WITH_INTERVIEW";
-} else if (hasEducation) {
-  responseType = "WITH_EDUCATION";
-} else if (hasProfile) {
-  responseType = "WITH_PROFILE";
-} else if (hasExp) {
-  responseType = "WITH_EXPERIENCE";
-} else if (hasDocuments) {
-  responseType = "WITH_DOCUMENTS";
-} else if (hasResumes) {
-  responseType = "WITH_RESUMES";
-} else if (hasApps) {
-  responseType = "WITH_APPLICATIONS";
+
+let responseType = detectResponseType(
+  question,
+  isSingleCandidateFinal,
+  totalFoundFinal
+);
+
+function refineResponseType({
+  responseType,
+  question,
+  projected,
+  analysis,
+  contentSections,
+}) {
+  const q = question.toLowerCase();
+
+  const isSingle = projected.length === 1;
+
+  // 🔥 1. YES/NO detection override
+  const isYesNoQuestion =
+    q.startsWith("is ") ||
+    q.startsWith("does ") ||
+    q.startsWith("do ") ||
+    q.startsWith("has ") ||
+    q.startsWith("have ");
+
+  if (isYesNoQuestion && isSingle) {
+    return "YES_NO";
+  }
+
+  // 🔥 2. Prevent NAME_LIST override when multiple sections requested
+  if (responseType === "NAME_LIST" && contentSections >= 1) {
+    if (q.includes("skill") || q.includes("education") || q.includes("experience")) {
+      return "MULTI_SECTION";
+    }
+  }
+
+  // 🔥 3. Single candidate + section → specific type
+  if (isSingle) {
+    if (q.includes("skill")) return "WITH_SKILLS";
+    if (q.includes("education")) return "WITH_EDUCATION";
+    if (q.includes("experience")) return "WITH_EXPERIENCE";
+    if (q.includes("profile")) return "WITH_PROFILE";
+  }
+
+  // 🔥 4. Prevent LIST for single candidate
+  if (responseType === "LIST" && isSingle) {
+    return "WITH_PROFILE";
+  }
+
+  return responseType;
 }
 
-// NAME_LIST override — always wins
+// 🔥 PRIORITY 1: NAME_LIST (highest priority)
 if (detectNameOnlyRequest(question)) {
   responseType = "NAME_LIST";
-  log.info("[ResponseType] NAME_LIST — user asked for names only");
 }
 
+// 🔥 PRIORITY 2: MULTI SECTION
+else if (contentSections >= 2) {
+  responseType = "MULTI_SECTION";
+}
+
+// 🔥 PRIORITY 3: SECTION BASED
+else if (hasSkills)       responseType = "WITH_SKILLS";
+else if (hasEducation)    responseType = "WITH_EDUCATION";
+else if (hasProfile)      responseType = "WITH_PROFILE";
+else if (hasExp)          responseType = "WITH_EXPERIENCE";
+else if (hasDocuments)    responseType = "WITH_DOCUMENTS";
+else if (hasResumes)      responseType = "WITH_RESUMES";
+else if (hasApps)         responseType = "WITH_APPLICATIONS";
+
+  log.info(
+    `[Step 3] isSingleCandidate: ${isSingleCandidate} | Sections: ${JSON.stringify(sections)} — userLimit: ${userLimit ?? "none"} — sending ${projected.length} of ${filtered.length} candidates to LLM`,
+  );
+responseType = refineResponseType({
+  responseType,
+  question,
+  projected,
+  analysis,
+  contentSections,
+});
+  if (analysis.entities?.candidateName) {
+    session.lastResolvedContext = {
+      candidateName: analysis.entities.candidateName,
+      jobTitle: analysis.entities.jobTitle ?? session.lastResolvedContext.jobTitle,
+    };
+  }
+
+
 log.info(`[ResponseType] ${responseType}`);
+
+
+function handleResponseType(responseType, projected, question) {
+  switch (responseType) {
+
+    case "YES_NO":
+      if (projected.length === 1) {
+        const c = projected[0];
+        if (question.toLowerCase().includes("studying")) {
+          return {
+            success: true,
+            answer: c["Currently Studying"]
+              ? `Yes, ${c.Name} is currently studying.`
+              : `No, ${c.Name} is not currently studying.`,
+            dataframe: projected,
+          };
+        }
+      }
+      return null;
+
+    case "COUNT":
+      return {
+        success: true,
+        answer: `There are ${projected.length} candidates matching your request.`,
+        dataframe: projected,
+      };
+
+    case "LIST":
+      const names = projected.map(c => c.FullName);
+      return {
+        success: true,
+        answer: names.length
+          ? `Here are the candidates:\n\n- ${names.join("\n- ")}`
+          : "No candidates found.",
+        dataframe: projected,
+      };
+
+    case "NAME_LIST": {
+  if (!projected || projected.length === 0) {
+    return {
+      success: true,
+      answer: "No candidates found.",
+      dataframe: [],
+    };
+  }
+
+  // 🔥 Respect user limit (if already sliced, safe)
+  const MAX_NAMES = 20; // safety cap
+  const finalList = projected.slice(0, MAX_NAMES);
+
+  const names = finalList.map((c, i) => `${i + 1}. ${c.FullName}`);
+
+  let answer = `Here are the candidate names:\n\n${names.join("\n")}`;
+
+  if (projected.length > MAX_NAMES) {
+    answer += `\n\n...and ${projected.length - MAX_NAMES} more candidates.`;
+  }
+
+  return {
+    success: true,
+    answer,
+    dataframe: finalList,
+  };
+}
+
+    case "WITH_SKILLS":
+    case "WITH_EDUCATION":
+    case "WITH_PROFILE":
+    case "WITH_EXPERIENCE":
+    case "WITH_DOCUMENTS":
+    case "WITH_RESUMES":
+    case "WITH_APPLICATIONS":
+    case "MULTI_SECTION":
+      return null; // fallback to LLM
+
+    default:
+      return null;
+  }
+}
+// ═══════════════════════════════════════
+// RESPONSE MAPPING ENGINE
+// ═══════════════════════════════════════
+const mappedResponse = handleResponseType(
+  responseType,
+  projected,
+  question
+);
+
+if (mappedResponse) {
+  return {
+    ...mappedResponse,
+    type: "CACHE",
+    isSingleCandidate: projected.length === 1,
+    entities: analysis.entities,
+  };
+}
+// ✅ YES / NO (Studying)
   const answer = await generateNaturalAnswer(
     question,
     `${SP_NAME} (cached at ${candidateStore.cachedAt.toLocaleString()})`,
@@ -585,7 +765,7 @@ log.info(`[ResponseType] ${responseType}`);
 //   if (analysis.entities?.candidateName) {
 //   lastTopic = null; // reset after applying
 // }
-  addToMemory("assistant", answer);
+  addToMemory(session,"assistant", answer);
 
   return {
     success: true,
@@ -639,11 +819,9 @@ export function clearCache() {
   log.info("Candidate cache cleared");
 }
 
-export function resetConversationContext() {
-  lastResolvedContext = {};
-  contextMemory = {};
-  conversationMemory = [];
-  log.info("Conversation context reset");
+export function resetConversationContext(sessionId = "default") {
+  sessions.delete(sessionId);
+  log.info(`Conversation context reset for session: ${sessionId}`);
 }
 
 //  SP LOADER
@@ -652,6 +830,7 @@ async function loadFromSp() {
   const pool = await getPool();
   const result = await pool.request().execute(SP_NAME);
   const rows = result.recordset || [];
+  
 
   if (!rows || rows.length === 0) {
     log.warn("SP returned 0 rows");
@@ -678,19 +857,18 @@ function detectGreeting(question) {
   const q = question.toLowerCase().trim();
 
   const greetings = [
-    "hi",
-    "hello",
-    "hey",
-    "hii",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "how are you",
-    "what's up",
-    "whats up"
+    "hi", "hello", "hey", "hii",
+    "good morning", "good afternoon", "good evening",
+    "how are you", "what's up", "whats up"
   ];
 
-  return greetings.some(g => q === g || q.includes(g));
+  return greetings.some(g => {
+    if (g.split(" ").length > 1) {
+      return q.includes(g); // multi-word phrases are fine
+    }
+    const regex = new RegExp(`\\b${g}\\b`);
+    return regex.test(q); // single word must match as whole word
+  });
 }
 
 function detectNameOnlyRequest(question) {
@@ -1077,9 +1255,8 @@ function fixMisclassifiedIntent(analysis, question) {
 
 // analyzeQuestion
 
-async function analyzeQuestion(question, candidates) {
- 
-  const cacheKey = `${question.toLowerCase().trim()}::${conversationMemory.length}`;
+async function analyzeQuestion(question, candidates, session) {
+  const cacheKey = `${question.toLowerCase().trim()}::${session.conversationMemory.length}`;
   const cached = analysisCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ANALYSIS_CACHE_TTL) {
     log.info(`[AnalysisCache] HIT for: "${cacheKey.slice(0, 60)}"`);
@@ -1178,7 +1355,9 @@ Return ONLY valid JSON — no markdown, no explanation.
     "hasItr":              boolean or null,
     "hasResume":           boolean or null,
     "resumeCount":         number or null,
-    "resumeCountOperator": "eq"|"gt"|"lt"|"gte"|"lte" or null
+    "resumeCountOperator": "eq"|"gt"|"lt"|"gte"|"lte" or null,
+    "registeredAfter":     string (ISO date) or null,
+    "registeredBefore":    string (ISO date) or null
   },
 
   "sectionsNeeded": "ALL" or string[]
@@ -1273,6 +1452,10 @@ ENTITY RULES:
     "students of MIT college"         → universityName: "MIT"
     "who studied at Nirma university" → universityName: "Nirma"
 
+ENTITY EXTRACTIONS that go into FILTERS (not entities):
+  phone number / mobile number    → filters.phoneNumber: "<number>"
+  email address / mail id         → filters.email: "<email>"
+
 CRITICAL — jobTitle vs city disambiguation:
 The word "in" before a job name does NOT mean location. These patterns ALL mean jobTitle:
   "candidate in X job"       → jobTitle: "X",     city: null
@@ -1302,7 +1485,15 @@ ROOT:
   "unverified candidates"         → isVerified: false
   "complete profile"              → isProfileComplete: true
   "incomplete profile"            → isProfileComplete: false
-  "phoneNumber": string or null
+
+ENTITY EXTRACTIONS (go into entities, not filters):
+  phone number / mobile number    → phoneNumber: "<number>"
+  email address / mail id         → email: "<email>"
+
+REGISTRATION DATE (go into filters):
+  "registered after Jan 2024"     → registeredAfter: "2024-01-01"
+  "registered before 2023"        → registeredBefore: "2023-01-01"
+  "joined this month"             → registeredAfter: "<first day of current month>"
 
 PROFILE:
   "studying" / "students"         → isStudying: true
@@ -1431,7 +1622,7 @@ Always include "root" in every specific array.
 When unsure → "ALL"
 
 Recent conversation (for pronoun/follow-up resolution ONLY — do NOT inherit entities like skill/city/jobTitle from previous turns):
-${buildConversationContext()}
+${buildConversationContext(session)}
 
 Current user question:
 "${question.replace(/"/g, '\\"')}"JSON:`.trim();
@@ -1528,9 +1719,7 @@ if (parsed.intent === "OOS") {
         "hasBankPassbook", "hasBankStatement", "hasSalarySlip", "hasExperienceLetter",
         "hasOfferLetter", "hasItr", "resumeCount", "resumeCountOperator",
         "hasLinkedin", "hasPortfolio", "ugDegree", "pgDegree", "hasPostGraduation",
-        "ugGraduationYear", "pgGraduationYear", "hasApplied",
-        "birthYear", "birthYearFrom", "birthYearTo","experienceYears", "experienceYearsOperator",
-  "experienceYearsFrom", "experienceYearsTo",
+        "ugGraduationYear", "pgGraduationYear", "hasApplied","birthYear", "birthYearFrom", "birthYearTo","experienceYears", "experienceYearsOperator","experienceYearsFrom", "experienceYearsTo","phoneNumber", "email","registeredAfter", "registeredBefore",
       ];
       FILTER_KEYS.forEach((key) => {
         if (normEntities[key] != null) {
@@ -1548,35 +1737,45 @@ if (parsed.intent === "OOS") {
         filters: normFilters,
         sectionsNeeded: parsed.sectionsNeeded || "ALL",
       };
-const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
+// const pronounPattern = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
 
-if (pronounPattern.test(question) && contextMemory.candidateName) {
-  const expanded = `${contextMemory.candidateName} ${question
-    .replace(/\b(his|her|their)\b/gi, "")
-    .replace(/\b(he|she|they|them|this person|the candidate|this candidate)\b/gi, "")
-    .trim()}`;
+// if (pronounPattern.test(question) && session.contextMemory.candidateName) {
+//   const expanded = `${session.contextMemory.candidateName} ${question
+//     .replace(/\b(his|her|their)\b/gi, "")
+//     .replace(/\b(he|she|they|them|this person|the candidate|this candidate)\b/gi, "")
+//     .trim()}`;
   
-  log.info(`[PronounExpand] "${question}" → "${expanded}"`);
-  question = expanded;
-}
+//   log.info(`[PronounExpand] "${question}" → "${expanded}"`);
+//   question = expanded;
+// }
       // STEP 3 — HANDLE “WHOSE?” (ADD HERE)
 if (
   result.intent === "CANDIDATE" &&
   !result.entities?.candidateName &&
-  !contextMemory?.candidateName
+  !session.contextMemory?.candidateName
 ) {
   const isListQuery =
     result.entities?.skill ||
     result.entities?.city ||
     result.entities?.state ||
     result.entities?.jobTitle ||
+    result.entities?.jobTitle ||
+  result.entities?.companyName ||
+  result.entities?.universityName ||
+  result.filters?.email ||        // ← check filters not entities
+  result.filters?.phoneNumber;
     Object.values(result.filters || {}).some(v => v != null);
 
+  // Only ask clarification if it's a vague single word AND
+  // no pronoun expansion already happened (i.e. question was not expanded)
   const isVagueFollowUp =
-    question.trim().split(/\s+/).length <= 2 && // very short: "education", "skills"
+    question.trim().split(/\s+/).length <= 2 &&
     /^(interview|education|skills?|experience|job)$/i.test(question.trim());
 
-  if (isVagueFollowUp && !isListQuery) {
+  const pronounAlreadyExpanded = PRONOUN_RE.test(question) === false &&
+    session.contextMemory?.candidateName != null;
+
+  if (isVagueFollowUp && !isListQuery && !pronounAlreadyExpanded) {
     return { intent: "CANDIDATE", askClarification: true, clarificationMessage: "Please specify the candidate name." };
   }
 }
@@ -1641,10 +1840,6 @@ function filterCandidates(entities, filters = {}) {
   pools.push(skillSet);
 }
 
- if (entities.city) {
-  const city = (candidate.Profile?.city || "").toLowerCase();
-  if (!city.includes(entities.city.toLowerCase())) return false;
-}
 
   if (entities.state) {
     const stateSet = candidateIndex.byState.get(entities.state.toLowerCase()) || [];
@@ -1693,6 +1888,23 @@ function filterCandidates(entities, filters = {}) {
 
   if (!match) return false;
 }
+
+ if (entities.city) {
+  const city = (candidate.Profile?.city || "").toLowerCase();
+  if (!city.includes(entities.city.toLowerCase())) return false;
+}
+// email filter
+    if (entities.email) {
+      const email = (candidate.email || "").toLowerCase();
+      if (!email.includes(entities.email.toLowerCase())) return false;
+    }
+
+    // phone filter
+    if (entities.phoneNumber) {
+      const phone = (candidate.phoneNumber || "").toString();
+      if (!phone.includes(entities.phoneNumber.toString())) return false;
+    }
+
     // company filter
     if (entities.companyName) {
       const match = (candidate.Experience || []).some(e =>
@@ -1725,13 +1937,28 @@ function filterCandidates(entities, filters = {}) {
 }
 
 
-function detectResponseType(question) {
+function detectResponseType(question, isSingleCandidate, totalFound) {
   const q = question.toLowerCase();
 
-  if (q.includes("education")) return "WITH_EDUCATION";
-  if (q.includes("skill")) return "WITH_SKILLS";
-  if (q.includes("resume")) return "WITH_RESUME";
-  if (q.includes("experience")) return "WITH_EXPERIENCE";
+  // YES / NO
+  if (/^(is|are|was|were|does|do|did|can|has|have)\b/.test(q)) {
+    return "YES_NO";
+  }
+
+  // COUNT
+  if (q.includes("how many") || q.includes("count")) {
+    return "COUNT";
+  }
+
+  // SINGLE candidate
+  if (isSingleCandidate) {
+    return "DETAIL";
+  }
+
+  // LIST
+  if (totalFound > 1) {
+    return "LIST";
+  }
 
   return "DEFAULT";
 }
@@ -1859,14 +2086,29 @@ const filterModules = [
 ];
 
 function matchesFilters(candidate, filters) {
-  if (filters.isVerified != null || filters.isProfileComplete != null) {
+ if (
+    filters.isVerified != null ||
+    filters.isProfileComplete != null ||
+    filters.registeredAfter != null ||
+    filters.registeredBefore != null ||
+     filters.phoneNumber ||       
+  filters.email  
+  ) {
     if (!filterRoot(candidate, filters)) return false;
   }
 
-  if (filters.gender || filters.languageKnown || filters.hasLinkedin != null) {
+if (
+    filters.gender ||
+    filters.languageKnown ||
+    filters.hasLinkedin != null ||
+    filters.isStudying != null ||
+    filters.hasPortfolio != null ||
+    filters.birthYear != null ||
+    filters.birthYearFrom != null ||
+    filters.birthYearTo != null
+  ) {
     if (!filterProfile(candidate, filters)) return false;
   }
-
   if (filters.ugDegree || filters.pgDegree) {
     if (!filterEducation(candidate, filters)) return false;
   }
@@ -2015,16 +2257,16 @@ if (filters.hasExperience === false) {
   ) {
     const totalYears = candidate._meta.experienceYears || 0;
 
-    if (filters.experienceYears != null) {
-      const target = Number(filters.experienceYears);
-      const op = filters.experienceYearsOperator || "eq";
+   if (filters.experienceYears != null) {
+  const target = Number(filters.experienceYears);
+  const op = filters.experienceYearsOperator || "eq";
 
-      if (op === "gte" && !(totalYears >= target)) return false;
-      if (op === "lt" && !(totalYears <= target)) return false;
-      if (op === "gte" && !(totalYears >= target)) return false;
-      if (op === "lte" && !(totalYears <= target)) return false;
-      if (op === "eq" && !(Math.abs(totalYears - target) <= 0.5)) return false;
-    }
+  if (op === "gt"  && !(totalYears >  target)) return false;
+  if (op === "lt"  && !(totalYears <  target)) return false;
+  if (op === "gte" && !(totalYears >= target)) return false;
+  if (op === "lte" && !(totalYears <= target)) return false;
+  if (op === "eq"  && !(Math.abs(totalYears - target) <= 0.5)) return false;
+}
   }
 
   return true;
@@ -2295,8 +2537,10 @@ function buildFilterLabel(entities, filters) {
  
   const parts = [];
 
-  if (entities?.candidateName) return `named "${entities.candidateName}"`;
-  if (entities?.jobTitle)      parts.push(`applied for "${entities.jobTitle}"`);
+  if (entities?.candidateName)  return `named "${entities.candidateName}"`;
+  if (entities?.email)          parts.push(`with email "${entities.email}"`);
+  if (entities?.phoneNumber)    parts.push(`with phone number "${entities.phoneNumber}"`);
+  if (entities?.jobTitle)       parts.push(`applied for "${entities.jobTitle}"`);
   if (entities?.skill)         parts.push(`with skill "${entities.skill}"`);
   if (entities?.city)          parts.push(`from "${entities.city}"`);
   if (entities?.state)         parts.push(`from "${entities.state}"`);

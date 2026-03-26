@@ -146,7 +146,18 @@ if (result === "OUT_OF_SCOPE") {
 
 function detectResponseType(question, isSingleCandidate, totalFound, sectionsNeeded) {
   const q = question.toLowerCase();
+// ── YES / NO QUESTIONS ───────────────────────────────────────────────
+const yesNoPatterns = [
+  "is ", "are ", "was ", "were ", "does ", "do ", "did ",
+  "can ", "has ", "have "
+];
+if (q.includes("how many") || q.includes("count")) {
+  return "COUNT";
+}
 
+if (yesNoPatterns.some(p => q.startsWith(p))) {
+  return "YES_NO";
+}
   // ── COMPARE ───────────────────────────────────────────────────────────────
   const compareWords = ["compare", "vs", "versus", "difference between", "contrast", "side by side"];
   if (compareWords.some((w) => q.includes(w))) return "COMPARE";
@@ -667,302 +678,6 @@ function formatTable(flatRows, options = {}) {
   return `${headers}\n${separator}\n${rows}${footer}`;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// generateNaturalAnswer — MAIN EXPORT
-// ═════════════════════════════════════════════════════════════════════════════
-//
-// The AI intro sentence call is intentionally KEPT here as requested.
-// It provides a contextual, human-feeling opener tailored to the question.
-// Streams via onChunk if provided, otherwise returns full string.
-//
-// export async function generateNaturalAnswer(
-//   question,
-//   sqlQuery,
-//   rows,
-//   options = {},
-//   onChunk = null,
-// ) {
-//   const client = getOpenAIClient();
-
-//   // ── No data ───────────────────────────────────────────────────────────────
-//   if (!rows || rows.length === 0) {
-//     const msg = "No records found matching your query.";
-//     if (onChunk) await onChunk(msg);
-//     return msg;
-//   }
-
-
-//   if (options.responseType === "WITH_EDUCATION") {
-//   return rows.map((c, i) => {
-//     const edu = c.Education?.[0];
-
-//     return `${i + 1}. ${c.FullName}
-// - Degree: ${edu?.UnderGraduationDegree || "N/A"}
-// - University: ${edu?.underGraduationUniversityName || "N/A"}`;
-//   }).join("\n\n");
-// } 
-
-//   if(options.responseType === "WITH_SKILLS") {
-//   return rows.map((c, i) => {
-//     const skills = (c.Skills || []).map(s => s.Skill).join(", ");
-
-//     return `${i + 1}. ${c.FullName}
-// - Skills: ${skills || "N/A"}`;
-//   }).join("\n\n");
-// }
-
-// if(options.responseType === "WITH_RESUME") {
-//   return rows.map((c, i) => {
-//     const hasResume = (c.Resumes || []).length > 0;
-
-//     return `${i + 1}. ${c.FullName}
-// - Resume: ${hasResume ? "Available" : "Not Available"}`;
-//   }).join("\n\n");
-// }
- 
-
-
-//   const {
-//     userLimit    = null,
-//     totalFound   = rows.length,
-//     isSingleCandidate = false,
-//     sectionsNeeded    = null,
-//   } = options;
-
-//   // ── Detect response type ──────────────────────────────────────────────────
-//   const responseType = detectResponseType(question, isSingleCandidate, totalFound, sectionsNeeded);
-//   log.info(`[ResponseType] ${responseType} | totalFound: ${totalFound} | isSingle: ${isSingleCandidate} | sections: ${JSON.stringify(sectionsNeeded)}`);
-
-//   // ── Flatten rows ──────────────────────────────────────────────────────────
-//   // NAME_LIST only needs the Name field — use summary mode (no detail fields)
-//   const flatMode = (responseType === "FULL_DETAILS" || responseType === "SKILLS_ONLY")
-//     ? "detail"
-//     : "summary";
-
-//   const flatRows = rows.map((r) =>
-//     flattenCandidate(
-//       r,
-//       flatMode,
-//       responseType === "SKILLS_ONLY" ? sectionsNeeded : null,
-//     )
-//   );
-
-//   const displayCount = flatRows.length;
-//   const hiddenCount  = totalFound - displayCount;
-
-//   // ── Build deterministic body (sync, zero LLM cost) ───────────────────────
-//   let body;
-//   switch (responseType) {
-//     case "NAME_LIST":   body = buildNameList(flatRows, totalFound);                   break;
-//     case "LIST":        body = buildList(flatRows, totalFound);                       break;
-//     case "SKILLS_ONLY": body = buildSkillsOnly(flatRows, totalFound, sectionsNeeded); break;
-//     case "FULL_DETAILS":body = buildFullDetails(flatRows);                            break;
-//     case "COMPARE":     body = buildCompare(flatRows, totalFound);                    break;
-//     case "SUMMARY":     body = buildSummary(flatRows, totalFound);                    break;
-//     default:            body = buildList(flatRows, totalFound);
-//   }
-
-//   // ── AI intro sentence — contextual, human opener (intentionally kept) ─────
-//   const introGuide = {
-//     NAME_LIST:   "Write a short intro like 'Here are all the candidate names:' or similar. Under 15 words.",
-//     LIST:        "Write a short intro like 'Here are the candidates I found:' or similar. Under 15 words.",
-//     SKILLS_ONLY: "Write a short intro referencing what was asked. Under 15 words.",
-//     FULL_DETAILS:"Write a short intro for a candidate profile. Under 15 words.",
-//     COMPARE:     "Write a short intro for a comparison. Under 15 words.",
-//     SUMMARY:     "Write a short intro for a summary overview. Under 15 words.",
-//   }[responseType] || "Write a short intro. Under 15 words.";
-
-//   const systemPrompt = `You are a helpful HR assistant. ${introGuide} No markdown.`;
-//   const userPrompt = `User asked: "${question}"\nFound: ${displayCount} candidate${displayCount !== 1 ? "s" : ""}${hiddenCount > 0 ? ` (${totalFound} total)` : ""}.\nWrite the intro sentence only.`;
-
-//   // ── STREAMING ─────────────────────────────────────────────────────────────
-//   if (onChunk) {
-//     try {
-//       const stream = await client.chat.completions.create({
-//         model: "gpt-4o-mini",
-//         messages: [
-//           { role: "system", content: systemPrompt },
-//           { role: "user", content: userPrompt },
-//         ],
-//         temperature: 0.3,
-//         max_tokens: 40,
-//         stream: true,
-//       });
-//       for await (const chunk of stream) {
-//         const token = chunk.choices[0]?.delta?.content || "";
-//         if (token) await onChunk(token);
-//       }
-//       await onChunk("\n\n" + body);
-//     } catch (err) {
-//       log.error("Streaming intro error:", err);
-//       await onChunk(`Found ${displayCount} candidate${displayCount !== 1 ? "s" : ""} matching your query.\n\n` + body);
-//     }
-//     return null;
-//   }
-
-//   // ── NON-STREAMING ─────────────────────────────────────────────────────────
-//   try {
-//     const resp = await client.chat.completions.create({
-//       model: "gpt-4o-mini",
-//       messages: [
-//         { role: "system", content: systemPrompt },
-//         { role: "user", content: userPrompt },
-//       ],
-//       temperature: 0.3,
-//       max_tokens: 40,
-//     });
-//     const intro = (resp.choices[0].message.content || "").trim();
-//     return `${intro}\n\n${body}`;
-//   } catch (err) {
-//     log.error("Intro generation error:", err);
-//     return `Found ${displayCount} candidate${displayCount !== 1 ? "s" : ""} matching your query.\n\n${body}`;
-//   }
-// }
-
-// export async function generateNaturalAnswer(
-//   question,
-//   sqlQuery,
-//   rows,
-//   options = {},
-//   onChunk = null,
-// ) {
-//   const client = getOpenAIClient();
-
-//   if (!rows || rows.length === 0) {
-//     const msg = "No records found matching your query.";
-//     if (onChunk) await onChunk(msg);
-//     return msg;
-//   }
-
-//   const {
-//     totalFound = rows.length,
-//     isSingleCandidate = false,
-//     sectionsNeeded = null,
-//   } = options;
-
-//   // 🧠 Detect response type
-//   const responseType = detectResponseType(
-//     question,
-//     isSingleCandidate,
-//     totalFound,
-//     sectionsNeeded
-//   );
-
-//   // 🧾 Flatten data
-//   const flatMode =
-//     responseType === "FULL_DETAILS" || responseType === "SKILLS_ONLY"
-//       ? "detail"
-//       : "summary";
-
-//   const flatRows = rows.map((r) =>
-//     flattenCandidate(
-//       r,
-//       flatMode,
-//       responseType === "SKILLS_ONLY" ? sectionsNeeded : null
-//     )
-//   );
-
-//   // ============================================================
-//   // 🧠 DECIDE: USE AI OR NOT
-//   // ============================================================
-//   const shouldUseAI =
-//     responseType === "LIST" ||
-//     responseType === "SUMMARY" ||
-//     responseType === "COMPARE" ||
-//     (!isSingleCandidate && totalFound > 1);
-
-//   // ============================================================
-//   // ⚡ FAST MODE (NO AI)
-//   // ============================================================
-//   if (!shouldUseAI) {
-//     let body;
-
-//     switch (responseType) {
-//       case "NAME_LIST":
-//         body = buildNameList(flatRows, totalFound);
-//         break;
-//       case "SKILLS_ONLY":
-//         body = buildSkillsOnly(flatRows, totalFound, sectionsNeeded);
-//         break;
-//       case "FULL_DETAILS":
-//         body = buildFullDetails(flatRows);
-//         break;
-//       default:
-//         body = buildList(flatRows, totalFound);
-//     }
-
-//     return body;
-//   }
-
-//   // ============================================================
-//   // 🤖 AI MODE (NATURAL RESPONSE)
-//   // ============================================================
-
-//   try {
-//     const limitedRows = flatRows.slice(0, 10); // control tokens
-
-//     const aiResponse = await client.chat.completions.create({
-//       model: "gpt-4o-mini",
-//       temperature: 0.4,
-//       max_tokens: 400,
-//       messages: [
-//         {
-//           role: "system",
-//           content: `
-// You are a smart HR assistant.
-
-// Your task:
-// Convert structured candidate data into a natural, human-like response.
-
-// STYLE:
-// - Write like ChatGPT
-// - Use conversational tone
-// - Combine filters into sentences
-// - DO NOT dump raw fields
-// - DO NOT output JSON
-// - Avoid bullet points unless necessary
-
-// RULES:
-// - Mention key filters (city, skills, experience, status)
-// - Summarize multiple candidates naturally
-// - If many candidates, summarize instead of listing all
-// - Keep it concise but informative
-// `,
-//         },
-//         {
-//           role: "user",
-//           content: `
-// User question:
-// "${question}"
-
-// Total candidates found: ${totalFound}
-
-// Candidate data:
-// ${JSON.stringify(limitedRows, null, 2)}
-
-// Write a natural language answer.
-// `,
-//         },
-//       ],
-//     });
-
-//     const answer = aiResponse.choices[0].message.content.trim();
-
-//     if (onChunk) {
-//       await onChunk(answer);
-//       return null;
-//     }
-
-//     return answer;
-//   } catch (err) {
-//     log.error("AI generation failed, falling back:", err);
-
-//     // 🛑 Fallback (important)
-//     const fallback = buildList(flatRows, totalFound);
-//     return `Found ${totalFound} candidates.\n\n${fallback}`;
-//   }
-// }
-
 export async function generateNaturalAnswer(
   question,
   sqlQuery,
@@ -1018,30 +733,33 @@ export async function generateNaturalAnswer(
   // ============================================================
   // ⚡ SIMPLE CASE (NO AI)
   // ============================================================
-  if (
-    responseType === "NAME_LIST" ||
-    responseType === "SKILLS_ONLY" ||
-    responseType === "FULL_DETAILS" ||
-    responseType === "MULTI_SECTION"
-  ) {
-    let body;
+ if (
+  responseType === "NAME_LIST" ||
+  responseType === "SKILLS_ONLY" ||
+  responseType === "FULL_DETAILS" ||
+  responseType === "MULTI_SECTION"
+) {
+  let body;
 
-    switch (responseType) {
-      case "NAME_LIST":
-        body = buildNameList(flatRows, totalFound);
-        break;
-      case "SKILLS_ONLY":
-        body = buildSkillsOnly(flatRows, totalFound, sectionsNeeded);
-        break;
-      case "FULL_DETAILS":
-        body = buildFullDetails(flatRows);
-        break;
-      default:
-        body = buildList(flatRows, totalFound);
-    }
-
-    return body;
+  switch (responseType) {
+    case "NAME_LIST":
+      body = buildNameList(flatRows, totalFound);
+      break;
+    case "SKILLS_ONLY":
+      body = buildSkillsOnly(flatRows, totalFound, sectionsNeeded);
+      break;
+    case "FULL_DETAILS":
+      body = buildFullDetails(flatRows);
+      break;
+    case "MULTI_SECTION":
+      body = buildMultiSection(rows, sectionsNeeded);
+      break;
+    default:
+      body = buildList(flatRows, totalFound);
   }
+
+  return body;
+}
 
   // In generateNaturalAnswer, where you check options.responseType
 // if (options.responseType === "MULTI_SECTION") {

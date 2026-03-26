@@ -1,11 +1,30 @@
 // src/routes/chat.routes.js
-
 import express from "express";
 import path from "path";
+import crypto from "crypto";
 import { handleChat, handleReset } from "../controllers/chat.controller.js";
 import { REPORTS_DIR } from "../config/constants.js";
+import { log } from "../utils/logger.js";
+
 
 const router = express.Router();
+
+router.use((req, res, next) => {
+  log.info(`[SessionDebug] cookies: ${JSON.stringify(req.cookies)} | x-session-id header: ${req.headers["x-session-id"]} | body.sessionId: ${req.body?.sessionId}`);
+  const existing = req.cookies?.chatSessionId || req.headers["x-session-id"] || req.body?.sessionId;
+  if (existing) {
+    req.resolvedSessionId = existing;
+  } else {
+    const newId = crypto.randomUUID();
+    res.cookie("chatSessionId", newId, {
+      httpOnly: true,
+      sameSite: "lax",
+      maxAge: 24 * 60 * 60 * 1000, // 1 day
+    });
+    req.resolvedSessionId = newId;
+  }
+  next();
+});
 
 router.post("/chat", handleChat);
 router.post("/reset", handleReset);

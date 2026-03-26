@@ -30,10 +30,10 @@ export function getVectorstore() {
   return vectorstore;
 }
 
-export function resetConversation() {
+export function resetConversation(sessionId = "default") {
   conversationHistory = [];
-  resetConversationContext();
-  log.info("Conversation history and context cleared.");
+  resetConversationContext(sessionId);
+  log.info(`Conversation history and context cleared for session: ${sessionId}`);
 }
 
 function runOutOfScope(question) {
@@ -70,11 +70,19 @@ const PRONOUN_RE = /\b(he|she|they|his|her|their|them|this person|the candidate|
 const POSSESSIVE_RE = /\b(his|her|their)\b/gi;
 const SUBJECT_RE = /\b(he|she|they|them|this person|the candidate|this candidate)\b/gi;
 
-let lastKnownCandidate = null; // track here in service layer too as safety net
+// let lastKnownCandidate = null; // track here in service layer too as safety net
 
-function expandPronouns(question) {
+const sessionCandidates = new Map();
+
+function expandPronouns(question, sessionId = "default") {
   if (!PRONOUN_RE.test(question)) return question;
-  if (!lastKnownCandidate) return question;
+
+  // Check both local map AND cache session for candidate name
+  const lastKnownCandidate = sessionCandidates.get(sessionId) ?? null;
+  if (!lastKnownCandidate) {
+    log.warn(`[PronounExpand] Pronoun detected but no candidate in session "${sessionId}" — skipping expansion`);
+    return question;
+  }
 
   // Remove pronouns and prepend candidate name
   const stripped = question
@@ -91,33 +99,40 @@ function expandPronouns(question) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN ENTRY POINT
 // ─────────────────────────────────────────────────────────────────────────────
-export async function chatbot(question, onChunk = null) {
+export async function chatbot(question, onChunk = null, sessionId = "default") {
   if (!question?.trim()) return runOutOfScope("(empty message)");
 
   question = question.trim();
 
-  // ── Step 1: expand pronouns before any routing ───────────────────────────
   const originalQuestion = question;
-  question = expandPronouns(question);
+  question = expandPronouns(question, sessionId);
+    log.info(`[PronounDebug] original: "${originalQuestion}" | expanded: "${question}" | session: "${sessionId}"`);
 
   log.info(`\nQuestion: "${originalQuestion}"${question !== originalQuestion ? ` → expanded: "${question}"` : ""}`);
 
-  // ── Step 2: route to cache ───────────────────────────────────────────────
-  const result = await answerFromCache(question, { onChunk });
+  const result = await answerFromCache(question, { onChunk, sessionId });
 
   if (result.success) {
     log.info("-> Route: CANDIDATE CACHE");
 
     // Track last resolved candidate for pronoun expansion
     if (result.isSingleCandidate && result.entities?.candidateName) {
-      lastKnownCandidate = result.entities.candidateName;
-      log.info(`[PronounTrack] lastKnownCandidate = "${lastKnownCandidate}"`);
+      // Single candidate by name — track for pronoun follow-up
+      sessionCandidates.set(sessionId, result.entities.candidateName);
+      log.info(`[PronounTrack] session="${sessionId}" lastKnownCandidate = "${result.entities.candidateName}"`);
+    } else if (!result.isSingleCandidate && result.dataframe?.length === 1) {
+      // List/filter query that returned exactly 1 result — track that candidate
+      const onlyCandidate = result.dataframe[0]?.FullName;
+      if (onlyCandidate) {
+        sessionCandidates.set(sessionId, onlyCandidate);
+        log.info(`[PronounTrack] Single result from list query — session="${sessionId}" lastKnownCandidate = "${onlyCandidate}"`);
+      }
+    } else {
+      // Multiple results — clear tracking so stale candidate is not used
+      sessionCandidates.delete(sessionId);
+      log.info(`[PronounTrack] Multiple results — cleared lastKnownCandidate for session="${sessionId}"`);
     }
 
-    // Clear candidate tracking when switching to list queries
-    if (!result.isSingleCandidate) {
-      lastKnownCandidate = null;
-    }
 
     pushHistory(originalQuestion, result.answer);
     return {
@@ -144,10 +159,6 @@ export async function chatbot(question, onChunk = null) {
     return r;
   }
 
-  // ── OOS fallback ─────────────────────────────────────────────────────────
-  // Only retry if the original question had a pronoun and we expanded it —
-  // meaning the expanded version was already tried above. If it still failed,
-  // it is genuinely OOS. Do NOT retry the same question blindly.
-  log.info("-> Final Route: OUT OF SCOPE");
-  return runOutOfScope(originalQuestion);
+log.info("-> Final Route: OUT OF SCOPE");
+return runOutOfScope(originalQuestion);
 }

@@ -10,6 +10,8 @@ import { getDbSchema } from "./services/sql.services.js";
 
 const PORT = process.env.PORT || 3001;
 const HOST = process.env.HOST || "[IP_ADDRESS]";
+import cookieParser from "cookie-parser";
+app.use(cookieParser());
 
 async function start() {
   console.log("Starting Chatbot...");
