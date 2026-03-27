@@ -3,6 +3,11 @@
 import { getPool } from "../db/connection.js";
 import { getOpenAIClient, generateNaturalAnswer } from "./ai.service.js";
 import { log } from "../utils/logger.js";
+import {
+  refineResponseType,
+  // resolveResponseType,
+  handleResponseType
+} from "./response.engine.js";
 
 const SP_NAME = "dbo.sp_GetAllCandidateDetails_Full";
 const CACHE_TTL_MS = 30 * 60 * 1000;
@@ -212,8 +217,77 @@ if (smallTalk) {
   };
 } 
   const analysis = await analyzeQuestion(question, candidateStore.candidates, session);
-  
-  
+  // 🔥 APPLY MULTI-FILTER EARLY (IMPORTANT)
+// 🔥 SMART FILTER RESET DETECTION
+const hasNewStrongEntity =
+  analysis.entities?.jobTitle ||
+  analysis.entities?.companyName ||
+  analysis.entities?.candidateName;
+
+const isNewQuery =
+  hasNewStrongEntity &&
+  !PRONOUN_RE.test(question); // not "his", "her"
+
+if (isNewQuery) {
+  session.contextMemory.lastFilters = {
+    entities: {},
+    filters: {}
+  };
+
+  log.info("[SmartReset] New query detected → cleared old filters");
+}
+
+const isFollowUpFilterQuery =
+  !analysis.entities?.candidateName &&
+  (
+    Object.keys(analysis.entities || {}).length > 0 ||
+    Object.keys(analysis.filters || {}).length > 0
+  );
+
+if (
+  isFollowUpFilterQuery &&
+  session.contextMemory.lastFilters
+) {
+  analysis.entities = {
+    ...(session.contextMemory.lastFilters.entities || {}),
+    ...analysis.entities,
+  };
+
+  analysis.filters = {
+    ...(session.contextMemory.lastFilters.filters || {}),
+    ...analysis.filters,
+  };
+
+  log.info("[MultiFilter] Early merge applied");
+}
+else if (
+  isFollowUpFilterQuery &&
+  session.contextMemory.lastFilters
+) {
+  analysis.entities = {
+    ...(session.contextMemory.lastFilters.entities || {}),
+    ...analysis.entities,
+  };
+
+  analysis.filters = {
+    ...(session.contextMemory.lastFilters.filters || {}),
+    ...analysis.filters,
+  };
+
+  log.info("[MultiFilter] Early merge applied");
+}
+  // 🔥 STRONG PRONOUN FOLLOW-UP HANDLING
+const isPronounQuery = PRONOUN_RE.test(question);
+
+if (
+  isPronounQuery &&
+  session.contextMemory.candidateName &&
+  !analysis.entities?.candidateName
+) {
+  analysis.entities.candidateName = session.contextMemory.candidateName;
+
+  log.info(`[FollowUpFix] Applied pronoun context → ${analysis.entities.candidateName}`);
+}
 
   // ── STEP: Reset context if this is a new independent query ──────────────
 const hasExplicitFilters = 
@@ -231,12 +305,19 @@ const isListQuery =
   analysis.entities?.phoneNumber ||
   analysis.entities?.universityName;
 
-if (isListQuery || hasExplicitFilters) {
+// 🔥 SMART CONTEXT RESET (DO NOT BREAK MULTI-FILTER)
+const isHardReset =
+  question.toLowerCase().includes("show all") ||
+  question.toLowerCase().includes("reset") ||
+  question.toLowerCase().includes("start over");
+
+if (isHardReset) {
   session.contextMemory.mode = "LIST";
   session.contextMemory.candidateName = null;
   session.lastTopic = null;
   session.conversationMemory = [];
-  log.info("[ContextReset] List/filter query detected — candidate context cleared");
+  session.contextMemory.lastFilters = {};
+  log.info("[ContextReset] Hard reset triggered");
 }
 
 if (
@@ -269,6 +350,21 @@ if (analysis.askClarification) {
     dataframe: [],
   };
 }
+if (!session.contextMemory.lastFilters) {
+  session.contextMemory.lastFilters = { entities: {},
+    filters: {}};
+}
+
+session.contextMemory.lastFilters = {
+  entities: {
+    ...(session.contextMemory.lastFilters?.entities || {}),
+    ...(analysis.entities || {}),
+  },
+  filters: {
+    ...(session.contextMemory.lastFilters?.filters || {}),
+    ...(analysis.filters || {}),
+  },
+};
 
   // 🔥 Update context memory
 const detectedTopics = detectTopics(question);
@@ -297,17 +393,6 @@ session.contextMemory.lastSections = analysis.sectionsNeeded;
 //   }
 // }
   // 🔥 New context memory fallback
-if (
-  analysis.intent !== "COUNT" &&
-  session.contextMemory.mode === "SINGLE" &&
-  session.contextMemory.candidateName &&
-  !analysis.entities.candidateName &&
-  !isListQuery &&
-  !hasExplicitFilters
-) {
-  analysis.entities.candidateName = session.contextMemory.candidateName;
-  log.info(`[ContextAI] Applied SINGLE context: ${session.contextMemory.candidateName}`);
-}
 
   
   fixMisclassifiedIntent(analysis, question);
@@ -326,7 +411,7 @@ if (currentTopics.length === 0 && session.lastTopic && analysis.entities?.candid
   const mergedSections = new Set(["root"]);
   const topicsToApply = Array.isArray(session.lastTopic) ? session.lastTopic : [session.lastTopic];
   
- for (const t of currentTopics) {  // or topicsToApply
+ for (const t of topicsToApply) {  // or topicsToApply
   if (t === "SKILLS")     mergedSections.add("Skills");
   if (t === "EDUCATION")  mergedSections.add("Education");
   if (t === "EXPERIENCE") mergedSections.add("Experience");
@@ -357,21 +442,22 @@ if (currentTopics.length === 0 && session.lastTopic && analysis.entities?.candid
     };
   }
 
-  const vaguePatterns = [
+const vaguePatterns = [
   "interview date",
   "job details",
-  "education",
-  "skills",
-  "experience",
   "interview status"
 ];
 
-const isVagueQuery = vaguePatterns.some(p =>
-  question.toLowerCase().includes(p)
-);
+const isVagueQuery =
+  !analysis.entities?.candidateName &&
+  !analysis.entities?.skill &&
+  !analysis.entities?.city &&
+  !analysis.entities?.state &&
+  !analysis.entities?.jobTitle &&
+  Object.keys(analysis.filters || {}).every(k => !analysis.filters[k]);
 
-if (isVagueQuery && !analysis.entities.candidateName) {
-    if (session.contextMemory.candidateName) {
+if (isVagueQuery) {
+  if (session.contextMemory.candidateName) {
     analysis.entities.candidateName = session.contextMemory.candidateName;
     log.info(`[ContextResolve] Filled missing candidate`);
   } else {
@@ -483,6 +569,7 @@ if (currentTopics.length > 0) {
   const isLowestMarks =
     (q.includes("lowest") || q.includes("least marks") || q.includes("minimum marks")) &&
     (q.includes("mark") || q.includes("score") || q.includes("marks"));
+// 🔥 MULTI-FILTER FOLLOW-UP SUPPORT
 
   
   const filtered = filterCandidates(analysis.entities, analysis.filters || {});
@@ -544,196 +631,65 @@ if (currentTopics.length > 0) {
 
   const slicedForLLM = sortedFiltered.slice(0, effectiveCap);
   const projected = projectData(slicedForLLM, sections);
-  // 🔥 RESPONSE TYPE (CORRECT PLACE)
-const isSingleCandidateFinal = projected.length === 1;
-const totalFoundFinal = filtered.length;
 
-const hasSkills    = sections.includes("Skills");
-const hasEducation = sections.includes("Education");
-const hasInterview = sections.includes("Applications.Interviews");
-const hasProfile   = sections.includes("Profile");
-const hasExp       = sections.includes("Experience");
-const hasDocuments = sections.includes("Documents");
-const hasResumes   = sections.includes("Resumes");
-const hasApps      = sections.includes("Applications");
-
-const contentSections = [
-  hasSkills, hasEducation, hasInterview, hasProfile, 
-  hasExp, hasDocuments, hasResumes, hasApps
-].filter(Boolean).length;
-
-let responseType = detectResponseType(
-  question,
-  isSingleCandidateFinal,
-  totalFoundFinal
-);
-
-function refineResponseType({
-  responseType,
+function resolveResponseType({
   question,
   projected,
-  analysis,
-  contentSections,
+  filtered,
+  sections
 }) {
-  const q = question.toLowerCase();
+  const isSingleCandidateFinal = projected.length === 1;
+  const totalFoundFinal = filtered.length;
 
-  const isSingle = projected.length === 1;
+  const hasSkills    = sections.includes("Skills");
+  const hasEducation = sections.includes("Education");
+  const hasProfile   = sections.includes("Profile");
+  const hasExp       = sections.includes("Experience");
+  const hasDocuments = sections.includes("Documents");
+  const hasResumes   = sections.includes("Resumes");
+  const hasApps      = sections.includes("Applications");
 
-  // 🔥 1. YES/NO detection override
-  const isYesNoQuestion =
-    q.startsWith("is ") ||
-    q.startsWith("does ") ||
-    q.startsWith("do ") ||
-    q.startsWith("has ") ||
-    q.startsWith("have ");
+  const contentSections = [
+    hasSkills, hasEducation, hasProfile,
+    hasExp, hasDocuments, hasResumes, hasApps
+  ].filter(Boolean).length;
 
-  if (isYesNoQuestion && isSingle) {
-    return "YES_NO";
-  }
-
-  // 🔥 2. Prevent NAME_LIST override when multiple sections requested
-  if (responseType === "NAME_LIST" && contentSections >= 1) {
-    if (q.includes("skill") || q.includes("education") || q.includes("experience")) {
-      return "MULTI_SECTION";
-    }
-  }
-
-  // 🔥 3. Single candidate + section → specific type
-  if (isSingle) {
-    if (q.includes("skill")) return "WITH_SKILLS";
-    if (q.includes("education")) return "WITH_EDUCATION";
-    if (q.includes("experience")) return "WITH_EXPERIENCE";
-    if (q.includes("profile")) return "WITH_PROFILE";
-  }
-
-  // 🔥 4. Prevent LIST for single candidate
-  if (responseType === "LIST" && isSingle) {
-    return "WITH_PROFILE";
-  }
-
-  return responseType;
-}
-
-// 🔥 PRIORITY 1: NAME_LIST (highest priority)
-if (detectNameOnlyRequest(question)) {
-  responseType = "NAME_LIST";
-}
-
-// 🔥 PRIORITY 2: MULTI SECTION
-else if (contentSections >= 2) {
-  responseType = "MULTI_SECTION";
-}
-
-// 🔥 PRIORITY 3: SECTION BASED
-else if (hasSkills)       responseType = "WITH_SKILLS";
-else if (hasEducation)    responseType = "WITH_EDUCATION";
-else if (hasProfile)      responseType = "WITH_PROFILE";
-else if (hasExp)          responseType = "WITH_EXPERIENCE";
-else if (hasDocuments)    responseType = "WITH_DOCUMENTS";
-else if (hasResumes)      responseType = "WITH_RESUMES";
-else if (hasApps)         responseType = "WITH_APPLICATIONS";
-
-  log.info(
-    `[Step 3] isSingleCandidate: ${isSingleCandidate} | Sections: ${JSON.stringify(sections)} — userLimit: ${userLimit ?? "none"} — sending ${projected.length} of ${filtered.length} candidates to LLM`,
+  let responseType = detectResponseType(
+    question,
+    isSingleCandidateFinal,
+    totalFoundFinal
   );
-responseType = refineResponseType({
-  responseType,
+
+  if (detectNameOnlyRequest(question)) {
+    responseType = "NAME_LIST";
+  } else if (contentSections >= 2) {
+    responseType = "MULTI_SECTION";
+  } else if (hasSkills) {
+    responseType = "WITH_SKILLS";
+  } else if (hasEducation) {
+    responseType = "WITH_EDUCATION";
+  } else if (hasProfile) {
+    responseType = "WITH_PROFILE";
+  } else if (hasExp) {
+    responseType = "WITH_EXPERIENCE";
+  }
+
+  return refineResponseType({
+    responseType,
+    question,
+    projected,
+    contentSections
+  });
+}
+
+  // 🔥 RESPONSE TYPE (CORRECT PLACE)
+const responseType = resolveResponseType({
   question,
   projected,
-  analysis,
-  contentSections,
+  filtered,
+  sections
 });
-  if (analysis.entities?.candidateName) {
-    session.lastResolvedContext = {
-      candidateName: analysis.entities.candidateName,
-      jobTitle: analysis.entities.jobTitle ?? session.lastResolvedContext.jobTitle,
-    };
-  }
 
-
-log.info(`[ResponseType] ${responseType}`);
-
-
-function handleResponseType(responseType, projected, question) {
-  switch (responseType) {
-
-    case "YES_NO":
-      if (projected.length === 1) {
-        const c = projected[0];
-        if (question.toLowerCase().includes("studying")) {
-          return {
-            success: true,
-            answer: c["Currently Studying"]
-              ? `Yes, ${c.Name} is currently studying.`
-              : `No, ${c.Name} is not currently studying.`,
-            dataframe: projected,
-          };
-        }
-      }
-      return null;
-
-    case "COUNT":
-      return {
-        success: true,
-        answer: `There are ${projected.length} candidates matching your request.`,
-        dataframe: projected,
-      };
-
-    case "LIST":
-      const names = projected.map(c => c.FullName);
-      return {
-        success: true,
-        answer: names.length
-          ? `Here are the candidates:\n\n- ${names.join("\n- ")}`
-          : "No candidates found.",
-        dataframe: projected,
-      };
-
-    case "NAME_LIST": {
-  if (!projected || projected.length === 0) {
-    return {
-      success: true,
-      answer: "No candidates found.",
-      dataframe: [],
-    };
-  }
-
-  // 🔥 Respect user limit (if already sliced, safe)
-  const MAX_NAMES = 20; // safety cap
-  const finalList = projected.slice(0, MAX_NAMES);
-
-  const names = finalList.map((c, i) => `${i + 1}. ${c.FullName}`);
-
-  let answer = `Here are the candidate names:\n\n${names.join("\n")}`;
-
-  if (projected.length > MAX_NAMES) {
-    answer += `\n\n...and ${projected.length - MAX_NAMES} more candidates.`;
-  }
-
-  return {
-    success: true,
-    answer,
-    dataframe: finalList,
-  };
-}
-
-    case "WITH_SKILLS":
-    case "WITH_EDUCATION":
-    case "WITH_PROFILE":
-    case "WITH_EXPERIENCE":
-    case "WITH_DOCUMENTS":
-    case "WITH_RESUMES":
-    case "WITH_APPLICATIONS":
-    case "MULTI_SECTION":
-      return null; // fallback to LLM
-
-    default:
-      return null;
-  }
-}
-// ═══════════════════════════════════════
-// RESPONSE MAPPING ENGINE
-// ═══════════════════════════════════════
 const mappedResponse = handleResponseType(
   responseType,
   projected,
@@ -748,6 +704,16 @@ if (mappedResponse) {
     entities: analysis.entities,
   };
 }
+  if (analysis.entities?.candidateName) {
+    session.lastResolvedContext = {
+      candidateName: analysis.entities.candidateName,
+      jobTitle: analysis.entities.jobTitle ?? session.lastResolvedContext.jobTitle,
+    };
+  }
+
+
+log.info(`[ResponseType] ${responseType}`);
+
 // ✅ YES / NO (Studying)
   const answer = await generateNaturalAnswer(
     question,
@@ -1894,16 +1860,16 @@ function filterCandidates(entities, filters = {}) {
   if (!city.includes(entities.city.toLowerCase())) return false;
 }
 // email filter
-    if (entities.email) {
-      const email = (candidate.email || "").toLowerCase();
-      if (!email.includes(entities.email.toLowerCase())) return false;
-    }
+    if (filters.email) {
+  const email = (candidate.email || "").toLowerCase();
+  if (!email.includes(filters.email.toLowerCase())) return false;
+}
 
     // phone filter
-    if (entities.phoneNumber) {
-      const phone = (candidate.phoneNumber || "").toString();
-      if (!phone.includes(entities.phoneNumber.toString())) return false;
-    }
+    if (filters.phoneNumber) {
+  const phone = (candidate.phoneNumber || "").toString();
+  if (!phone.includes(filters.phoneNumber.toString())) return false;
+}
 
     // company filter
     if (entities.companyName) {
