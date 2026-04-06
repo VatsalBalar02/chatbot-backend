@@ -1,12 +1,23 @@
 import { loadPdfVectorstore } from "./rag.service.js";
 import { runPdfMode } from "./rag.service.js";
 import { runReportMode } from "./report.service.js";
-import { warmUp, answerFromCache, resetConversationContext } from "./candidate.cache.js";
+import {
+  warmUp,
+  answerFromCache,
+  resetConversationContext,
+} from "./candidate.cache.js";
 import { log } from "../utils/logger.js";
 import { PDF_PATH, VECTRA_DIR, MAX_HISTORY } from "../config/constants.js";
 
 let vectorstore = null;
-let conversationHistory = [];
+const conversationHistories = new Map();
+
+function getConversationHistory(sessionId) {
+  if (!conversationHistories.has(sessionId)) {
+    conversationHistories.set(sessionId, []);
+  }
+  return conversationHistories.get(sessionId);
+}
 
 export async function init() {
   log.info("Step 1/2: Loading PDF vectorstore...");
@@ -31,13 +42,16 @@ export function getVectorstore() {
 }
 
 export function resetConversation(sessionId = "default") {
-  conversationHistory = [];
+  conversationHistories.delete(sessionId);
   resetConversationContext(sessionId);
-  log.info(`Conversation history and context cleared for session: ${sessionId}`);
+  log.info(
+    `Conversation history and context cleared for session: ${sessionId}`,
+  );
 }
 
 function runOutOfScope(question) {
-  const shortQ = question.length > 70 ? question.slice(0, 70) + "..." : question;
+  const shortQ =
+    question.length > 70 ? question.slice(0, 70) + "..." : question;
   return {
     type: "OUT_OF_SCOPE",
     answer:
@@ -53,47 +67,14 @@ function runOutOfScope(question) {
   };
 }
 
-function pushHistory(question, answer) {
+function pushHistory(question, answer, sessionId = "default") {
+  const history = getConversationHistory(sessionId);
   const historyAnswer = answer ?? "(streamed response)";
-  conversationHistory.push({ role: "user", content: question });
-  conversationHistory.push({ role: "assistant", content: historyAnswer });
-  if (conversationHistory.length > MAX_HISTORY * 2) {
-    conversationHistory.splice(0, conversationHistory.length - MAX_HISTORY * 2);
+  history.push({ role: "user", content: question });
+  history.push({ role: "assistant", content: historyAnswer });
+  if (history.length > MAX_HISTORY * 2) {
+    history.splice(0, history.length - MAX_HISTORY * 2);
   }
-}
-
-// ── Pronoun expander ─────────────────────────────────────────────────────────
-// Expands "his skills" → "Dilip Prajapat skills" using last known candidate
-// This runs BEFORE answerFromCache so GPT never sees raw pronouns
-// ─────────────────────────────────────────────────────────────────────────────
-const PRONOUN_RE = /\b(he|she|they|his|her|their|them|this person|the candidate|this candidate)\b/i;
-const POSSESSIVE_RE = /\b(his|her|their)\b/gi;
-const SUBJECT_RE = /\b(he|she|they|them|this person|the candidate|this candidate)\b/gi;
-
-// let lastKnownCandidate = null; // track here in service layer too as safety net
-
-const sessionCandidates = new Map();
-
-function expandPronouns(question, sessionId = "default") {
-  if (!PRONOUN_RE.test(question)) return question;
-
-  // Check both local map AND cache session for candidate name
-  const lastKnownCandidate = sessionCandidates.get(sessionId) ?? null;
-  if (!lastKnownCandidate) {
-    log.warn(`[PronounExpand] Pronoun detected but no candidate in session "${sessionId}" — skipping expansion`);
-    return question;
-  }
-
-  // Remove pronouns and prepend candidate name
-  const stripped = question
-    .replace(POSSESSIVE_RE, "")   // remove "his", "her", "their"
-    .replace(SUBJECT_RE, "")      // remove "he", "she", "they" etc
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const expanded = `${lastKnownCandidate} ${stripped}`.trim();
-  log.info(`[PronounExpand] "${question}" → "${expanded}"`);
-  return expanded;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,36 +86,13 @@ export async function chatbot(question, onChunk = null, sessionId = "default") {
   question = question.trim();
 
   const originalQuestion = question;
-  question = expandPronouns(question, sessionId);
-    log.info(`[PronounDebug] original: "${originalQuestion}" | expanded: "${question}" | session: "${sessionId}"`);
-
-  log.info(`\nQuestion: "${originalQuestion}"${question !== originalQuestion ? ` → expanded: "${question}"` : ""}`);
+  log.info(`\nQuestion: "${originalQuestion}"`);
 
   const result = await answerFromCache(question, { onChunk, sessionId });
 
   if (result.success) {
     log.info("-> Route: CANDIDATE CACHE");
-
-    // Track last resolved candidate for pronoun expansion
-    if (result.isSingleCandidate && result.entities?.candidateName) {
-      // Single candidate by name — track for pronoun follow-up
-      sessionCandidates.set(sessionId, result.entities.candidateName);
-      log.info(`[PronounTrack] session="${sessionId}" lastKnownCandidate = "${result.entities.candidateName}"`);
-    } else if (!result.isSingleCandidate && result.dataframe?.length === 1) {
-      // List/filter query that returned exactly 1 result — track that candidate
-      const onlyCandidate = result.dataframe[0]?.FullName;
-      if (onlyCandidate) {
-        sessionCandidates.set(sessionId, onlyCandidate);
-        log.info(`[PronounTrack] Single result from list query — session="${sessionId}" lastKnownCandidate = "${onlyCandidate}"`);
-      }
-    } else {
-      // Multiple results — clear tracking so stale candidate is not used
-      sessionCandidates.delete(sessionId);
-      log.info(`[PronounTrack] Multiple results — cleared lastKnownCandidate for session="${sessionId}"`);
-    }
-
-
-    pushHistory(originalQuestion, result.answer);
+    pushHistory(originalQuestion, result.answer, sessionId);
     return {
       type: "CANDIDATE",
       answer: result.answer,
@@ -148,17 +106,17 @@ export async function chatbot(question, onChunk = null, sessionId = "default") {
   if (intent === "PDF") {
     log.info("-> Route: PDF");
     const r = await runPdfMode(question, conversationHistory, vectorstore);
-    pushHistory(originalQuestion, r.answer);
+    pushHistory(originalQuestion, r.answer, sessionId);
     return r;
   }
 
   if (intent === "REPORT") {
     log.info("-> Route: REPORT");
     const r = await runReportMode(question, conversationHistory);
-    pushHistory(originalQuestion, r.answer);
+    pushHistory(originalQuestion, r.answer, sessionId);
     return r;
   }
 
-log.info("-> Final Route: OUT OF SCOPE");
-return runOutOfScope(originalQuestion);
+  log.info("-> Final Route: OUT OF SCOPE");
+  return runOutOfScope(originalQuestion);
 }
